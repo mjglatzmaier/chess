@@ -23,15 +23,15 @@ protected:
 
 public:
 
-	parameter<T>(T&& in, std::string& s) : tag(s)
+	parameter(T&& in, std::string& s) : tag(s)
 	{
 		value = util::make_unique<T>(in);
 		bits = *reinterpret_cast<unsigned long*>(value.get());
 	}
-	parameter<T>(T& in, std::string& s) : tag(s) { set(in); }
-	parameter<T>(T& in) : tag("") { set(in); }
-	parameter<T>(const parameter<T>& o) { tag = o.tag;  set(*o.value); }
-	virtual ~parameter<T>() {}
+	parameter(T& in, std::string& s) : tag(s) { set(in); }
+	parameter(T& in) : tag("") { set(in); }
+	parameter(const parameter<T>& o) { tag = o.tag;  set(*o.value); }
+	virtual ~parameter() {}
 
 	parameter<T>& operator=(const parameter<T>& o) { tag = o.tag; set(*o.value); }
 	T& operator()() { return *value; }

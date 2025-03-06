@@ -89,16 +89,16 @@ private:
 
 
 public:
-	Threadpool<T>() { }
+	Threadpool() { }
 
-	Threadpool<T>(const unsigned int n) :
+	Threadpool(const unsigned int n) :
 		busy(0), processed(0), stop(false), num_threads(n)
 	{
 		for (unsigned int i = 0; i < n; ++i)
 			workers.emplace_back(new T(std::bind(&Threadpool<T>::thread_func, this)));
 	}
 
-	~Threadpool<T>() { if (!stop) exit(); }
+	~Threadpool() { if (!stop) exit(); }
 
 	T* operator[](const int& idx) { return workers[idx]; }
 
