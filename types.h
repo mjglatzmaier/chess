@@ -27,6 +27,7 @@ typedef uint8_t U8;
 
 #else
 #include <stdint.h>
+#include <cstring>
 typedef int16_t int16;
 typedef const uint64_t C64;
 typedef const uint32_t C32;
