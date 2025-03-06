@@ -10,7 +10,7 @@ A multi-threaded, UCI compliant C++ chess engine written in C++.
 ## Build Instructions
 
 ### Prerequisites
-- **C++ Compiler**: Requires C++17 (GCC, Clang, or MSVC)
+- **C++ Compiler**: Requires C++20 (GCC, Clang, or MSVC)
 - **CMake**: Version 3.10+ is recommended
 
 ### Windows (MSVC or MinGW)

@@ -20,19 +20,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Source Files
 ###################################################################
 set(SRC_FILES
-  bitboards.cpp
-  evaluate.cpp
-  hashtable.cpp
-  haVoc.cpp
-  magics.cpp
-  material.cpp
-  order.cpp
-  pawns.cpp
-  pgn.cpp
-  position.cpp
-  threads.cpp
-  uci.cpp
-  zobrist.cpp
+  src/bitboards.cpp
+  src/evaluate.cpp
+  src/hashtable.cpp
+  src/haVoc.cpp
+  src/magics.cpp
+  src/material.cpp
+  src/order.cpp
+  src/pawns.cpp
+  src/pgn.cpp
+  src/position.cpp
+  src/threads.cpp
+  src/uci.cpp
+  src/zobrist.cpp
 )
 
 ###################################################################
@@ -54,13 +54,13 @@ if(WIN32)
   endif()
 else()
   if ("${CMAKE_BUILD_TYPE}" STREQUAL "Release")
-     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -fomit-frame-pointer -fstrict-aliasing -ffast-math -Wa -mbig-obj -O3 -std=c++20 -D_64BIT -D_CONSOLE -D_UNICODE -mavx")
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic -fomit-frame-pointer -fstrict-aliasing -ffast-math -O3 -std=c++20 -D_64BIT -D_CONSOLE -D_UNICODE -mavx")
   elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wa -Wall -g -ggdb -O0 -std=c++20 -D_DEBUG -D_64BIT -D_CONSOLE -D_UNICODE")
   endif()
 endif()
 
-
+include_directories(${PROJECT_SOURCE_DIR}/src)
 add_executable(${PROGRAM} ${SRC_FILES})
 
 

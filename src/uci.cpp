@@ -1,11 +1,9 @@
 
 #include "uci.h"
 #include "move.h"
-#include "bench.h"
 #include "search.h"
 #include "threads.h"
 #include "hashtable.h"
-//#include "tuning_manager.h"
 #include "threads.h"
 
 position uci_pos;
@@ -157,33 +155,10 @@ bool uci::parse_command(const std::string& input) {
 			}
 			else std::cout << cmd << " is not a legal move" << std::endl;
 		}
-		else if (cmd == "perft" && instream >> cmd) {
-			Perft perft;
-			perft.go(atoi(cmd.c_str()));
-		}
-		else if (cmd == "gen" && instream >> cmd) {
-			Perft perft;
-			U64 xs = U64(atoi(cmd.c_str()));
-			perft.gen(uci_pos, xs);
-		}
-		else if (cmd == "divide" && instream >> cmd) {
-			Perft perft;
-			perft.divide(uci_pos, atoi(cmd.c_str()));
-		}
-		else if (cmd == "tune") {
-			Perft perft;
-			perft.auto_tune();
-		}
-		else if (cmd == "bench" && instream >> cmd) {
-			Perft perft;
-			int depth = atoi(cmd.c_str());
-			perft.bench(depth, true);
-		}
 		else if (cmd == "debug") {
 			uci_pos.debug_search = !uci_pos.debug_search;
 			std::cout << "debugging set to: " << uci_pos.debug_search << std::endl;
 		}
-
 
 		// game specific uci commands (refactor?)
 		else if (cmd == "isready") {
