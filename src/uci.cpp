@@ -54,6 +54,7 @@ bool parse_command(const std::string& input, SearchEngine& engine, position& uci
                 load_position(tmp, uci_pos);
             }
         } else if (cmd == "setoption" && instream >> cmd && instream >> cmd) {
+            std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
             if (cmd == "hash" && instream >> cmd && instream >> cmd) {
                 auto sz = std::stoi(cmd);
                 engine.set_hash_size(sz);
@@ -73,6 +74,11 @@ bool parse_command(const std::string& input, SearchEngine& engine, position& uci
             }
             if (cmd == "bookfile" && instream >> cmd && instream >> cmd) {
                 havoc::book::load(cmd);
+                break;
+            }
+            if (cmd == "paramfile" && instream >> cmd && instream >> cmd) {
+                engine.load_params(cmd);
+                std::cout << "info string Loaded parameters from " << cmd << std::endl;
                 break;
             }
         } else if (cmd == "d") {
@@ -134,6 +140,7 @@ bool parse_command(const std::string& input, SearchEngine& engine, position& uci
             std::cout << "option name Hash type spin default 1024 min 1 max 33554432" << std::endl;
             std::cout << "option name SyzygyPath type string default <empty>" << std::endl;
             std::cout << "option name BookFile type string default <empty>" << std::endl;
+            std::cout << "option name ParamFile type string default <empty>" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "bench") {
             static const std::vector<std::string> bench_fens = {

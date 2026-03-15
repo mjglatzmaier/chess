@@ -55,6 +55,7 @@ class SearchEngine {
     void set_threads(int n);
     void set_hash_size(int mb);
     void clear();
+    void load_params(const std::string& filename);
 
   private:
     hash_table tt_;
