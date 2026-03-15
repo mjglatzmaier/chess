@@ -3,8 +3,9 @@ set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 GAMES=${1:-500}
-DEPTH=${2:-4}
+DEPTH=${2:-6}
 ITERATIONS=${3:-3}
+THREADS=${4:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 BUILD_DIR="./build"
 DATAGEN="$BUILD_DIR/havoc_datagen"
 TUNER="$BUILD_DIR/havoc_texel"
@@ -13,7 +14,7 @@ DATA_FILE="training_data.epd"
 PARAMS_FILE="tuned_params.txt"
 
 echo "=== haVoc Parameter Tuning Pipeline ==="
-echo "Games: $GAMES, Depth: $DEPTH, Iterations: $ITERATIONS"
+echo "Games: $GAMES, Depth: $DEPTH, Iterations: $ITERATIONS, Threads: $THREADS"
 echo ""
 
 # ── Step 1: Build ─────────────────────────────────────────────────────────────
@@ -24,7 +25,7 @@ echo ""
 
 # ── Step 2: Generate training data ───────────────────────────────────────────
 echo "--- Generating training data ($GAMES games at depth $DEPTH) ---"
-"$DATAGEN" --games "$GAMES" --depth "$DEPTH" --output "$DATA_FILE"
+"$DATAGEN" --games "$GAMES" --depth "$DEPTH" --threads "$THREADS" --output "$DATA_FILE"
 echo ""
 
 # ── Step 3: Run Texel tuning ─────────────────────────────────────────────────

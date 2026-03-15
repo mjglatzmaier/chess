@@ -279,7 +279,7 @@ void SearchEngine::iterative_deepening(position& p, U16 depth, bool silent, int 
             if (signals_.stop.load())
                 break;
 
-            if (eval <= alpha || eval >= beta)
+            if (!silent && (eval <= alpha || eval >= beta))
                 readout_pv(stack, p.root_moves, eval, alpha, beta, static_cast<U16>(id));
 
             if (eval <= alpha) {
