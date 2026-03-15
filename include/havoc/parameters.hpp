@@ -10,14 +10,35 @@
 
 namespace havoc {
 
+/// Tuning stages for hierarchical parameter optimization.
+enum class TuneStage {
+    category, // Stage 1: category-level scale factors
+    shape,    // Stage 2: curve shapes and individual weights
+    fine      // Stage 3: PSTs, material values
+};
+
 struct parameters {
-    float tempo = 1.0f;
+    // ── Category-level scale factors (percentage: 100 = 1.0x) ───────────────
+    int sq_score_category_scale = 100;
+    int mobility_category_scale = 100;
+    int king_safety_category_scale = 100;
+    int threat_category_scale = 100;
+    int passed_pawn_category_scale = 100;
+    int pawn_structure_category_scale = 100;
+    int space_category_scale = 100;
+    int king_danger_divisor = 256;
+    int tempo = 0; // centipawns, side-to-move advantage. Tuned in stage 2 only.
 
     // Piece-square score scaling (indexed by Piece enum)
     std::vector<int> sq_score_scaling{1, 1, 1, 1, 1};
 
     // Mobility scaling (indexed by Piece enum)
     std::vector<int> mobility_scaling{1, 1, 1, 1, 1};
+
+    // Per-piece mobility curve scale factors (percentage: 100 = 1.0x)
+    int knight_mobility_scale = 100;
+    int bishop_mobility_scale = 100;
+    int rook_mobility_scale = 100;
 
     // Mobility tables (moved from hce.cpp anonymous namespace)
     std::array<int, 9> knight_mobility_table = {-50, -30, -15, -6, 2, 8, 13, 17, 20};
@@ -113,7 +134,7 @@ struct parameters {
     bool save(const std::string& filename) const;
 
     /// Returns all tunable params as name/pointer pairs for the tuner.
-    std::vector<std::pair<std::string, int*>> all_params();
+    std::vector<std::pair<std::string, int*>> all_params(TuneStage stage = TuneStage::shape);
 };
 
 } // namespace havoc

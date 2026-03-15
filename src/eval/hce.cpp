@@ -58,7 +58,7 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
 
     // Lazy eval cutoff
     if (lazy_margin > 0 && !ei.me->is_endgame() && std::abs(score) >= lazy_margin)
-        return (p.to_move() == white ? score : -score) + static_cast<int>(params_.tempo);
+        return (p.to_move() == white ? score : -score) + params_.tempo;
 
     // Endgame specialization
     if (ei.me->is_endgame()) {
@@ -90,19 +90,28 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
         }
     }
 
-    score += eval_pawns<white>(p, ei) - eval_pawns<black>(p, ei);
-    score += eval_knights<white>(p, ei) - eval_knights<black>(p, ei);
-    score += eval_bishops<white>(p, ei) - eval_bishops<black>(p, ei);
-    score += eval_rooks<white>(p, ei) - eval_rooks<black>(p, ei);
-    score += eval_queens<white>(p, ei) - eval_queens<black>(p, ei);
-    score += eval_king<white>(p, ei) - eval_king<black>(p, ei);
-    score += eval_passed_pawns<white>(p, ei) - eval_passed_pawns<black>(p, ei);
+    // Apply category-level scale factors (percentage: 100 = 1.0x)
+    int pawn_score = eval_pawns<white>(p, ei) - eval_pawns<black>(p, ei);
+    int piece_score = (eval_knights<white>(p, ei) - eval_knights<black>(p, ei)) +
+                      (eval_bishops<white>(p, ei) - eval_bishops<black>(p, ei)) +
+                      (eval_rooks<white>(p, ei) - eval_rooks<black>(p, ei)) +
+                      (eval_queens<white>(p, ei) - eval_queens<black>(p, ei));
+    int king_score = eval_king<white>(p, ei) - eval_king<black>(p, ei);
+    int passed_score = eval_passed_pawns<white>(p, ei) - eval_passed_pawns<black>(p, ei);
+
+    score += (pawn_score * params_.pawn_structure_category_scale) / 100;
+    score += (piece_score * params_.sq_score_category_scale) / 100;
+    score += (king_score * params_.king_safety_category_scale) / 100;
+    score += (passed_score * params_.passed_pawn_category_scale) / 100;
 
     if (lazy_margin > 0 && !ei.me->is_endgame() && std::abs(score) >= lazy_margin)
-        return (p.to_move() == white ? score : -score) + static_cast<int>(params_.tempo);
+        return (p.to_move() == white ? score : -score) + params_.tempo;
 
-    score += eval_threats<white>(p, ei) - eval_threats<black>(p, ei);
-    score += eval_space<white>(p, ei) - eval_space<black>(p, ei);
+    int threat_score = eval_threats<white>(p, ei) - eval_threats<black>(p, ei);
+    int space_score = eval_space<white>(p, ei) - eval_space<black>(p, ei);
+
+    score += (threat_score * params_.threat_category_scale) / 100;
+    score += (space_score * params_.space_category_scale) / 100;
 
     // Endgame scaling
     int scale = 128;
@@ -127,7 +136,7 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
         score = (score * scale) / 128;
 
     int side_to_move = (p.to_move() == white) ? 1 : -1;
-    return side_to_move * (score + static_cast<int>(params_.tempo));
+    return side_to_move * (score + params_.tempo);
 }
 
 // ─── eval_pawns ─────────────────────────────────────────────────────────────
@@ -176,7 +185,7 @@ template <Color c> int HCEEvaluator::eval_knights(const position& p, einfo& ei) 
             int mob = (cnt < params_.knight_mobility_table.size())
                           ? params_.knight_mobility_table[cnt]
                           : params_.knight_mobility_table.back();
-            score += params_.mobility_scaling[knight] * mob;
+            score += (params_.knight_mobility_scale * params_.mobility_scaling[knight] * mob) / 100;
         }
 
         // Outpost
@@ -269,7 +278,7 @@ template <Color c> int HCEEvaluator::eval_bishops(const position& p, einfo& ei) 
         int mob_val = (mob_cnt < params_.bishop_mobility_table.size())
                           ? params_.bishop_mobility_table[mob_cnt]
                           : params_.bishop_mobility_table.back();
-        int mobility_score = params_.mobility_scaling[bishop] * mob_val;
+        int mobility_score = (params_.bishop_mobility_scale * params_.mobility_scaling[bishop] * mob_val) / 100;
         if ((sq_bb & p.pinned<c>()) && mobility_score > 0)
             mobility_score /= params_.pinned_scaling[bishop];
 
@@ -365,7 +374,7 @@ template <Color c> int HCEEvaluator::eval_rooks(const position& p, einfo& ei) {
         int mob_r = (static_cast<unsigned>(free_sqs) < params_.rook_mobility_table.size())
                         ? params_.rook_mobility_table[free_sqs]
                         : params_.rook_mobility_table.back();
-        int mobility_score = params_.mobility_scaling[rook] * mob_r;
+        int mobility_score = (params_.rook_mobility_scale * params_.mobility_scaling[rook] * mob_r) / 100;
 
         if (sq_bb & p.pinned<c>())
             mobility_score /= params_.pinned_scaling[rook];
@@ -497,7 +506,7 @@ template <Color c> int HCEEvaluator::eval_king(const position& p, einfo& ei) {
                 danger_score +=
                     static_cast<int>(ei.kattackers[them][j]) * params_.attacker_weight[j];
 
-            score -= (danger_score * danger_score) / 256;
+            score -= (danger_score * danger_score) / params_.king_danger_divisor;
 
             score += params_.king_safe_sqs[std::min(7, bits::count(mvs))];
 

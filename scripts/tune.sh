@@ -28,9 +28,13 @@ echo "--- Generating training data ($GAMES games at depth $DEPTH) ---"
 "$DATAGEN" --games "$GAMES" --depth "$DEPTH" --threads "$THREADS" --output "$DATA_FILE"
 echo ""
 
-# ── Step 3: Run Texel tuning ─────────────────────────────────────────────────
-echo "--- Running Texel tuning ($ITERATIONS iterations) ---"
-"$TUNER" --data "$DATA_FILE" --output "$PARAMS_FILE" --iterations "$ITERATIONS"
+# ── Step 3: Run staged Texel tuning ──────────────────────────────────────────
+echo "--- Stage 1: Category normalization (coarse) ---"
+"$TUNER" --data "$DATA_FILE" --output "$PARAMS_FILE" --stage 1 --iterations 3
+echo ""
+
+echo "--- Stage 2: Shape tuning (medium) ---"
+"$TUNER" --data "$DATA_FILE" --params "$PARAMS_FILE" --output "$PARAMS_FILE" --stage 2 --iterations "$ITERATIONS"
 echo ""
 
 # ── Step 4: Bake into source ─────────────────────────────────────────────────
