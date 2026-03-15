@@ -269,6 +269,7 @@ int main(int argc, char* argv[]) {
     std::string output = "training_data.epd";
     int skip_moves = 8;
     int min_elo = 0;
+    int max_elo = 99999;
     int max_games = 0;
     bool append = false;
     std::vector<std::string> pgn_files;
@@ -281,6 +282,8 @@ int main(int argc, char* argv[]) {
             skip_moves = std::stoi(argv[++i]);
         else if (arg == "--min-elo" && i + 1 < argc)
             min_elo = std::stoi(argv[++i]);
+        else if (arg == "--max-elo" && i + 1 < argc)
+            max_elo = std::stoi(argv[++i]);
         else if (arg == "--max-games" && i + 1 < argc)
             max_games = std::stoi(argv[++i]);
         else if (arg == "--append" || arg == "-a")
@@ -290,6 +293,7 @@ int main(int argc, char* argv[]) {
                       << "  -o, --output FILE   Output EPD file (default: training_data.epd)\n"
                       << "  --skip-moves N      Skip first N moves (default: 8)\n"
                       << "  --min-elo N         Minimum player Elo (default: 0)\n"
+                      << "  --max-elo N         Maximum player Elo (default: 99999)\n"
                       << "  --max-games N       Max games to process (default: 0=all)\n"
                       << "  -a, --append        Append to existing file\n";
             return 0;
@@ -326,7 +330,9 @@ int main(int argc, char* argv[]) {
             double result = parse_result(game.result);
             if (result < 0) { ++skipped; continue; }
 
-            if (min_elo > 0 && (game.white_elo < min_elo || game.black_elo < min_elo)) {
+            if ((min_elo > 0 || max_elo < 99999) &&
+                (game.white_elo < min_elo || game.black_elo < min_elo ||
+                 game.white_elo > max_elo || game.black_elo > max_elo)) {
                 ++skipped;
                 continue;
             }
