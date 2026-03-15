@@ -92,13 +92,15 @@ static double play_game(SearchEngine& engine, int depth, int random_plies,
     return 0.5;
 }
 
-/// Worker function: each thread plays its share of games independently.
+/// Worker function: each thread plays its share of games, flushing to disk periodically.
 static void worker(int thread_id, int games_per_thread, int depth, int random_plies,
-                   unsigned seed, std::vector<DatagenPosition>& out_positions,
-                   std::mutex& out_mutex, std::atomic<int>& games_done, int total_games) {
+                   unsigned seed, const std::string& output_file,
+                   std::mutex& file_mutex, std::atomic<int>& games_done,
+                   std::atomic<uint64_t>& total_positions, int total_games) {
     std::mt19937 rng(seed + thread_id);
     SearchEngine engine;
-    std::vector<DatagenPosition> local_positions;
+    std::vector<DatagenPosition> buffer;
+    constexpr int FLUSH_INTERVAL = 10; // flush every N games
 
     for (int g = 0; g < games_per_thread; ++g) {
         std::vector<DatagenPosition> game_positions;
@@ -106,21 +108,28 @@ static void worker(int thread_id, int games_per_thread, int depth, int random_pl
 
         for (auto& p : game_positions) {
             p.result = result;
-            local_positions.push_back(p);
+            buffer.push_back(p);
         }
 
         int done = ++games_done;
-        if (done % 50 == 0 || done == total_games) {
-            std::lock_guard<std::mutex> lock(out_mutex);
-            std::cout << "Progress: " << done << "/" << total_games
-                      << "  positions so far: " << local_positions.size() << " (thread "
-                      << thread_id << ")" << std::endl;
+
+        // Flush buffer to disk periodically
+        if (g % FLUSH_INTERVAL == (FLUSH_INTERVAL - 1) || g == games_per_thread - 1) {
+            std::lock_guard<std::mutex> lock(file_mutex);
+            std::ofstream out(output_file, std::ios::app);
+            for (const auto& p : buffer) {
+                out << p.fen << " c9 \"" << p.result << "\";\n";
+            }
+            total_positions += buffer.size();
+            buffer.clear();
+
+            if (done % 50 == 0 || done == total_games) {
+                std::cout << "Progress: " << done << "/" << total_games
+                          << "  total positions: " << total_positions.load()
+                          << std::endl;
+            }
         }
     }
-
-    // Merge into shared output
-    std::lock_guard<std::mutex> lock(out_mutex);
-    out_positions.insert(out_positions.end(), local_positions.begin(), local_positions.end());
 }
 
 static void print_usage(const char* prog) {
@@ -130,6 +139,7 @@ static void print_usage(const char* prog) {
               << "  --threads N      Parallel game threads (default: CPU count)\n"
               << "  --random-plies N Random opening plies (default: 6)\n"
               << "  --output FILE    Output EPD file (default: training_data.epd)\n"
+              << "  --append         Append to existing file (resume interrupted run)\n"
               << "  --seed N         Random seed (default: time-based)\n";
 }
 
@@ -139,6 +149,7 @@ int main(int argc, char* argv[]) {
     int num_threads = static_cast<int>(std::thread::hardware_concurrency());
     int random_plies = 6;
     std::string output = "training_data.epd";
+    bool append = false;
     unsigned seed =
         static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count());
 
@@ -154,6 +165,8 @@ int main(int argc, char* argv[]) {
             random_plies = std::stoi(argv[++i]);
         else if ((key == "--output" || key == "-o") && i + 1 < argc)
             output = argv[++i];
+        else if (key == "--append" || key == "-a")
+            append = true;
         else if (key == "--seed" && i + 1 < argc)
             seed = static_cast<unsigned>(std::stoul(argv[++i]));
         else if (key == "--help" || key == "-h") {
@@ -164,6 +177,22 @@ int main(int argc, char* argv[]) {
 
     if (num_threads < 1) num_threads = 1;
 
+    // Count existing positions if appending
+    uint64_t existing_positions = 0;
+    if (append) {
+        std::ifstream check(output);
+        if (check.is_open()) {
+            std::string line;
+            while (std::getline(check, line))
+                if (!line.empty()) ++existing_positions;
+            std::cout << "Appending to " << output << " (" << existing_positions
+                      << " existing positions)" << std::endl;
+        }
+    } else {
+        // Truncate file
+        std::ofstream(output, std::ios::trunc).close();
+    }
+
     std::cout << "haVoc datagen: " << num_games << " games, depth " << depth << ", "
               << num_threads << " threads, " << random_plies << " random plies" << std::endl;
 
@@ -173,9 +202,9 @@ int main(int argc, char* argv[]) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    std::vector<DatagenPosition> all_positions;
-    std::mutex out_mutex;
+    std::mutex file_mutex;
     std::atomic<int> games_done{0};
+    std::atomic<uint64_t> total_positions{existing_positions};
 
     // Distribute games across threads
     std::vector<std::thread> threads;
@@ -184,27 +213,21 @@ int main(int argc, char* argv[]) {
 
     for (int t = 0; t < num_threads; ++t) {
         int count = base + (t < remainder ? 1 : 0);
-        threads.emplace_back(worker, t, count, depth, random_plies, seed, std::ref(all_positions),
-                             std::ref(out_mutex), std::ref(games_done), num_games);
+        threads.emplace_back(worker, t, count, depth, random_plies, seed,
+                             std::cref(output), std::ref(file_mutex),
+                             std::ref(games_done), std::ref(total_positions), num_games);
     }
 
     for (auto& t : threads)
         t.join();
 
-    // Write EPD
-    std::ofstream out(output);
-    for (const auto& p : all_positions) {
-        out << p.fen << " c9 \"" << p.result << "\";" << std::endl;
-    }
-    out.close();
-
     auto elapsed = std::chrono::steady_clock::now() - t0;
     double secs = std::chrono::duration<double>(elapsed).count();
     double gps = num_games / secs;
 
-    std::cout << "\nWrote " << all_positions.size() << " positions to " << output << " in "
-              << static_cast<int>(secs) << "s (" << static_cast<int>(gps) << " games/sec)"
-              << std::endl;
+    std::cout << "\nDone: " << total_positions.load() << " total positions in " << output
+              << " (" << static_cast<int>(secs) << "s, " << static_cast<int>(gps)
+              << " games/sec)" << std::endl;
 
     return 0;
 }
