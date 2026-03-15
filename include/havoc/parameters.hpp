@@ -29,7 +29,7 @@ struct parameters {
     int pawn_structure_category_scale = 78;
     int space_category_scale = 76;
     int king_danger_divisor = 276;
-    int tempo = 0; // centipawns, side-to-move advantage. Tuned in stage 2 only.
+    int tempo = 5; // centipawns, fixed small side-to-move advantage. Not tuned.
 
     // Piece-square score scaling (indexed by Piece enum)
     std::vector<int> sq_score_scaling{1, 1, 1, 1, 1};

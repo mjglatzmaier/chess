@@ -79,7 +79,8 @@ std::vector<std::pair<std::string, int*>> parameters::all_params(TuneStage stage
 
     if (stage == TuneStage::shape) {
         // Stage 2: Individual weights and curve shapes (~50-100 params)
-        result.emplace_back("tempo", &tempo);
+        // NOTE: tempo is excluded — it's a bias term that interferes with
+        // weight tuning. Set it manually to a small value (5-15cp).
 
         // Per-piece mobility scale factors
         result.emplace_back("knight_mobility_scale", &knight_mobility_scale);
