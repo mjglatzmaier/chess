@@ -1,6 +1,7 @@
 #include "havoc/search.hpp"
 
 #include "havoc/bitboard.hpp"
+#include "havoc/eval/hce.hpp"
 #include "havoc/movegen.hpp"
 #include "havoc/position.hpp"
 
@@ -40,6 +41,16 @@ void SearchEngine::set_hash_size(int mb) {
 void SearchEngine::clear() {
     tt_.clear();
     history_.clear();
+}
+
+void SearchEngine::load_params(const std::string& filename) {
+    params_.load(filename);
+    for (unsigned i = 0; i < search_threads_.size(); ++i) {
+        search_threads_[i]->params = params_;
+        search_threads_[i]->evaluator = std::make_unique<HCEEvaluator>(
+            search_threads_[i]->pawn_tbl, search_threads_[i]->material_tbl,
+            search_threads_[i]->params);
+    }
 }
 
 // ─── Pruning helpers ────────────────────────────────────────────────────────
@@ -268,7 +279,7 @@ void SearchEngine::iterative_deepening(position& p, U16 depth, bool silent, int 
             if (signals_.stop.load())
                 break;
 
-            if (eval <= alpha || eval >= beta)
+            if (!silent && (eval <= alpha || eval >= beta))
                 readout_pv(stack, p.root_moves, eval, alpha, beta, static_cast<U16>(id));
 
             if (eval <= alpha) {
@@ -538,6 +549,10 @@ int SearchEngine::search(position& pos, int alpha, int beta, U16 depth, SearchNo
         (stack + 1)->pv = nullptr;
 
         int score_val = score::kNegInf;
+        // PVS full-window threshold: give first N moves a full window before
+        // switching to null-window searches. Textbook PVS uses < 1, but with
+        // weaker move ordering < 3 avoids costly re-searches.
+        // TODO: revisit after Texel tuning improves move ordering (try < 2 or < 1)
         if (moves_searched < 3) {
             (stack + 1)->pv = pv_line;
             (stack + 1)->pv[0].set(A1, A1, no_type);

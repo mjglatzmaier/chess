@@ -46,6 +46,9 @@ set(HAVOC_CORE_SOURCES
     src/thread_pool.cpp
     src/search.cpp
     src/uci.cpp
+    src/parameters.cpp
+    src/tablebase.cpp
+    src/book.cpp
 )
 
 add_library(havoc_core STATIC ${HAVOC_CORE_SOURCES})
@@ -88,4 +91,24 @@ endif()
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 if(HAVOC_ENABLE_BENCH)
     add_subdirectory(bench)
+endif()
+
+# ── Tuning Tools ─────────────────────────────────────────────────────────────
+option(HAVOC_BUILD_TOOLS "Build tuning tools (datagen, texel)" OFF)
+
+if(HAVOC_BUILD_TOOLS)
+    add_executable(havoc_datagen tools/datagen.cpp)
+    target_link_libraries(havoc_datagen PRIVATE havoc_core)
+    target_include_directories(havoc_datagen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    havoc_set_warnings(havoc_datagen)
+
+    add_executable(havoc_texel tools/texel_tune.cpp)
+    target_link_libraries(havoc_texel PRIVATE havoc_core)
+    target_include_directories(havoc_texel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    havoc_set_warnings(havoc_texel)
+
+    add_executable(havoc_pgn2epd tools/pgn2epd.cpp)
+    target_link_libraries(havoc_pgn2epd PRIVATE havoc_core)
+    target_include_directories(havoc_pgn2epd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    havoc_set_warnings(havoc_pgn2epd)
 endif()

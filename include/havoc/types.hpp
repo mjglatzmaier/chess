@@ -166,7 +166,11 @@ enum EndgameType {
     KqbK = 130,
     KqrK = 132,
     KqqK = 136,
-    Unknown = 137
+    // Single piece vs bare king
+    KRK = 200,  // King + Rook vs King
+    KQK = 201,  // King + Queen vs King
+    KBNK = 202, // King + Bishop + Knight vs King
+    Unknown = 250
 };
 
 /// Castling rights bitmask values.
