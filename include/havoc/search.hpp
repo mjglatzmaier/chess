@@ -1,0 +1,96 @@
+#pragma once
+
+/// @file search.hpp
+/// @brief Alpha-beta search engine for haVoc.
+
+#include "havoc/move_order.hpp"
+#include "havoc/thread_pool.hpp"
+#include "havoc/tt.hpp"
+#include "havoc/types.hpp"
+#include "havoc/utils.hpp"
+
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace havoc {
+
+// ─── Search limits (from UCI go command) ────────────────────────────────────
+
+struct SearchLimits {
+    unsigned wtime = 0, btime = 0, winc = 0, binc = 0;
+    unsigned movestogo = 0, nodes = 0, movetime = 0, mate = 0, depth = 0;
+    bool infinite = false, ponder = false;
+};
+
+// ─── Search signals ─────────────────────────────────────────────────────────
+
+struct SearchSignals {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ponder_hit{false};
+};
+
+// ─── Forward declarations for move_to_string (used by readout) ──────────────
+
+namespace uci {
+std::string move_to_string(const Move& m);
+}
+
+// ─── Search engine ──────────────────────────────────────────────────────────
+
+class SearchEngine {
+  public:
+    SearchEngine();
+    ~SearchEngine();
+
+    void start(position& p, SearchLimits& lims, bool silent);
+    void stop();
+    void wait();
+
+    SearchSignals& signals() { return signals_; }
+    hash_table& tt() { return tt_; }
+    U64 total_nodes() const;
+
+    void set_threads(int n);
+    void set_hash_size(int mb);
+    void clear();
+
+  private:
+    hash_table tt_;
+    Threadpool<Searchthread> search_threads_;
+    Threadpool<Workerthread> worker_;
+    SearchSignals signals_;
+    parameters params_;
+    std::atomic<bool> searching_{false};
+    std::atomic<int> sel_depth_{0};
+    std::mutex output_mutex_;
+    int multi_pv_ = 1;
+
+    // Per-search state
+    std::vector<std::unique_ptr<position>> positions_;
+    Movehistory history_;
+
+    // Search methods
+    void iterative_deepening(position& p, U16 depth, bool silent, int thread_id);
+
+    template <Nodetype type>
+    int search(position& pos, int alpha, int beta, U16 depth, SearchNode* stack, int thread_id);
+
+    template <Nodetype type>
+    int qsearch(position& pos, int alpha, int beta, U16 depth, SearchNode* stack, int thread_id);
+
+    void search_timer(position& p, SearchLimits& lims);
+    double estimate_max_time(position& p, SearchLimits& lims);
+    static void update_pv(Move* root_pv, const Move& move, Move* child);
+    void readout_pv(SearchNode* stack, const Rootmoves& roots, int eval, int alpha, int beta,
+                    U16 depth);
+
+    // Pruning helpers
+    static unsigned reduction(bool pv_node, bool improving, int d, int mc);
+    static int futility_move_count(bool improving, U16 depth);
+    static float lazy_eval_margin_search(int depth, bool advanced_pawn);
+    static float lazy_eval_margin(int depth, bool advanced_pawn);
+};
+
+} // namespace havoc

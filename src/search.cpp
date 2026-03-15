@@ -1,0 +1,874 @@
+#include "havoc/search.hpp"
+
+#include "havoc/bitboard.hpp"
+#include "havoc/movegen.hpp"
+#include "havoc/position.hpp"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <thread>
+
+namespace havoc {
+
+namespace {
+const std::vector<float> kMaterialVals{100.0f, 300.0f, 315.0f, 480.0f, 910.0f};
+} // namespace
+
+// ─── Construction / configuration ───────────────────────────────────────────
+
+SearchEngine::SearchEngine() : worker_(1) {
+    search_threads_.init(1);
+}
+
+SearchEngine::~SearchEngine() {
+    stop();
+    wait();
+}
+
+void SearchEngine::set_threads(int n) {
+    n = std::max(n, 1);
+    search_threads_.init(n);
+}
+
+void SearchEngine::set_hash_size(int mb) {
+    tt_.resize(static_cast<size_t>(mb));
+}
+
+void SearchEngine::clear() {
+    tt_.clear();
+    history_.clear();
+}
+
+// ─── Pruning helpers ────────────────────────────────────────────────────────
+
+unsigned SearchEngine::reduction(bool pv_node, bool improving, int d, int mc) {
+    return bitboards::reductions[static_cast<int>(pv_node)][static_cast<int>(improving)]
+                                [std::max(0, std::min(d, 63))][std::max(0, std::min(mc, 63))];
+}
+
+int SearchEngine::futility_move_count(bool improving, U16 depth) {
+    return (6 + depth * depth) / (2 - static_cast<int>(improving));
+}
+
+float SearchEngine::lazy_eval_margin_search(int depth, bool advanced_pawn) {
+    return advanced_pawn ? -1.0f : 225.0f * (1.0f - std::exp((depth - 64.0f) / 20.0f));
+}
+
+float SearchEngine::lazy_eval_margin(int depth, bool advanced_pawn) {
+    return advanced_pawn ? -1.0f : 225.0f * (1.0f - std::exp((depth - 64.0f) / 20.0f));
+}
+
+// ─── Start search ───────────────────────────────────────────────────────────
+
+void SearchEngine::start(position& p, SearchLimits& lims, bool silent) {
+    // Wait for any previous search to finish
+    wait();
+
+    positions_.clear();
+    history_.clear();
+
+    signals_.stop = false;
+
+    p.set_nodes_searched(0);
+    p.set_qnodes_searched(0);
+
+    // Load root moves
+    Movegen mvs(p);
+    mvs.generate<pseudo_legal, pieces>();
+    p.root_moves.clear();
+    for (int i = 0; i < mvs.size(); ++i) {
+        if (!p.is_legal(mvs[i]))
+            continue;
+        p.root_moves.push_back(Rootmove(mvs[i]));
+    }
+
+    // Create per-thread copies
+    for (unsigned i = 0; i < search_threads_.size(); ++i) {
+        positions_.emplace_back(std::make_unique<position>(p));
+    }
+
+    U16 depth = (lims.depth > 0 ? static_cast<U16>(lims.depth) : static_cast<U16>(MAX_PLY));
+    searching_ = true;
+
+    // Launch the entire search on the worker thread so UCI loop stays responsive.
+    // The worker thread manages the timer, search threads, and result collection.
+    worker_.enqueue([this, &p, &lims, depth, silent]() {
+        // Launch timer
+        Threadpool<Workerthread> timer_thread(1);
+        timer_thread.enqueue([this, &p, &lims]() { search_timer(p, lims); });
+
+        // Launch helper threads
+        if (search_threads_.size() > 1) {
+            for (unsigned i = 1; i < search_threads_.size(); ++i) {
+                int tid = static_cast<int>(i);
+                search_threads_.enqueue([this, tid, depth, silent]() {
+                    iterative_deepening(*positions_[tid], depth, silent, tid);
+                });
+            }
+        }
+
+        // Launch main thread search
+        search_threads_.enqueue(
+            [this, depth, silent]() { iterative_deepening(*positions_[0], depth, silent, 0); });
+
+        search_threads_.wait_finished();
+        signals_.stop = true;
+
+        // Collect results
+        Rootmoves bestRoots;
+        int16_t max_score = score::kNegInf;
+        for (auto& t : positions_) {
+            if (!t->root_moves.empty() && t->root_moves[0].score > max_score) {
+                max_score = t->root_moves[0].score;
+                bestRoots = t->root_moves;
+            }
+        }
+
+        if (bestRoots.empty())
+            bestRoots = positions_[0]->root_moves;
+
+        // Copy results back to the original position
+        p.root_moves = bestRoots;
+
+        if (!silent && !bestRoots.empty()) {
+            std::cout << "bestmove " << uci::move_to_string(bestRoots[0].pv[0]);
+            if (bestRoots[0].pv.size() > 1)
+                std::cout << " ponder " << uci::move_to_string(bestRoots[0].pv[1]);
+            std::cout << std::endl;
+        }
+
+        searching_ = false;
+    });
+}
+
+void SearchEngine::stop() {
+    signals_.stop = true;
+}
+
+void SearchEngine::wait() {
+    worker_.wait_finished();
+}
+
+// ─── Timer ──────────────────────────────────────────────────────────────────
+
+void SearchEngine::search_timer(position& p, SearchLimits& lims) {
+    util::Clock c;
+    bool fixed_time = lims.movetime > 0;
+    int delay = 1;
+    double time_limit = estimate_max_time(p, lims);
+    auto sleep = [delay]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    };
+
+    double elapsed = 0;
+    if (fixed_time) {
+        do {
+            elapsed = c.elapsed_ms();
+            sleep();
+        } while (!signals_.stop.load() && searching_.load() &&
+                 elapsed <= static_cast<double>(lims.movetime));
+    } else if (time_limit > -1) {
+        do {
+            elapsed = c.elapsed_ms();
+            sleep();
+        } while (!signals_.stop.load() && searching_.load() && elapsed <= time_limit);
+    } else {
+        do {
+            elapsed = c.elapsed_ms();
+            sleep();
+        } while (!signals_.stop.load() && searching_.load());
+    }
+    signals_.stop = true;
+}
+
+double SearchEngine::estimate_max_time(position& p, SearchLimits& lims) {
+    if (lims.infinite || lims.ponder || lims.depth > 0)
+        return -1.0;
+    if (lims.movetime != 0)
+        return static_cast<double>(lims.movetime);
+
+    double our_time = (p.to_move() == white ? lims.wtime : lims.btime);
+    double our_inc = (p.to_move() == white ? lims.winc : lims.binc);
+
+    if (our_time <= 0)
+        return -1.0;
+
+    double moves_left;
+    if (lims.movestogo > 0) {
+        moves_left = static_cast<double>(lims.movestogo);
+    } else {
+        // Sudden death: estimate moves remaining
+        moves_left = 25.0;
+    }
+
+    // Base time allocation
+    double base_time = our_time / moves_left + our_inc * 0.9;
+
+    // Don't use more than 1/3 of remaining time
+    double max_time = our_time * 0.33;
+
+    // Apply a minimum of 50ms to avoid flagging
+    double time_limit = std::max(50.0, std::min(base_time, max_time));
+
+    return time_limit;
+}
+
+// ─── Iterative deepening ────────────────────────────────────────────────────
+
+void SearchEngine::iterative_deepening(position& p, U16 depth, bool silent, int thread_id) {
+    int alpha = score::kNegInf;
+    int beta = score::kInf;
+    int delta = 65;
+    int smallDelta = 33;
+    int eval = score::kNegInf;
+
+    if (params_.fixed_depth > 0)
+        depth = static_cast<U16>(params_.fixed_depth);
+
+    constexpr unsigned stack_size = MAX_PLY + 4;
+    SearchNode stack[stack_size];
+    Move pv_line[MAX_PLY + 4];
+
+    (stack + 2)->pv = pv_line;
+
+    bool is_main = (thread_id == 0);
+
+    for (unsigned id = 1 + static_cast<unsigned>(thread_id); id <= depth; ++id) {
+        if (signals_.stop.load())
+            break;
+
+        (stack + 0)->ply = (stack + 1)->ply = (stack + 2)->ply = 0;
+
+        bool failLow = false;
+        bool failHigh = false;
+
+        // Aspiration window search
+        while (true) {
+            if (id >= 2) {
+                alpha = std::max(eval - smallDelta, static_cast<int>(score::kNegInf));
+                beta = std::min(eval + smallDelta, static_cast<int>(score::kInf));
+                if (failLow) {
+                    beta = std::min(beta + delta, static_cast<int>(score::kInf));
+                    failLow = false;
+                }
+                if (failHigh) {
+                    alpha = std::max(alpha - delta, static_cast<int>(score::kNegInf));
+                    failHigh = false;
+                }
+            }
+
+            sel_depth_ = 0;
+            eval = search<root>(p, alpha, beta, static_cast<U16>(id), stack + 2, thread_id);
+
+            std::stable_sort(p.root_moves.begin(), p.root_moves.end());
+
+            if (signals_.stop.load())
+                break;
+
+            if (eval <= alpha || eval >= beta)
+                readout_pv(stack, p.root_moves, eval, alpha, beta, static_cast<U16>(id));
+
+            if (eval <= alpha) {
+                delta += delta / 4;
+                failHigh = true;
+            } else if (eval >= beta) {
+                delta += delta / 4;
+                failLow = true;
+            } else {
+                break;
+            }
+        }
+
+        // Print PV
+        if (is_main && !signals_.stop.load()) {
+            if (!silent)
+                readout_pv(stack, p.root_moves, eval, alpha, beta, static_cast<U16>(id));
+
+            if (id == depth) {
+                signals_.stop = true;
+                break;
+            }
+        }
+    }
+}
+
+// ─── Main search ────────────────────────────────────────────────────────────
+
+template <Nodetype type>
+int SearchEngine::search(position& pos, int alpha, int beta, U16 depth, SearchNode* stack,
+                         int thread_id) {
+    if (signals_.stop.load())
+        return score::kDraw;
+
+    assert(alpha < beta);
+
+    int bestScore = score::kNegInf;
+    Move best_move{};
+    best_move.type = static_cast<U8>(no_type);
+
+    Move ttm{};
+    ttm.type = static_cast<U8>(no_type);
+    Move pv_line[MAX_PLY + 4];
+    int ttvalue = score::kNegInf;
+    U8 tt_depth = 0;
+    U8 tt_bound = static_cast<U8>(no_bound);
+
+    bool in_check = pos.in_check();
+    std::vector<Move> quiets;
+    stack->in_check = in_check;
+    stack->ply = (stack - 1)->ply + 1;
+
+    U16 root_dist = stack->ply;
+    const bool root_node = (type == Nodetype::root && stack->ply == 1);
+    const bool pvNode = (root_node || type == Nodetype::pv);
+    bool is_main = (thread_id == 0);
+
+    if (pvNode && sel_depth_.load() < stack->ply + 1 && is_main)
+        sel_depth_++;
+
+    if (!root_node && !in_check && pos.is_draw())
+        return score::kDraw;
+
+    { // mate distance pruning
+        int mating_score = score::kMate - root_dist;
+        beta = std::min(mating_score, beta);
+        if (alpha >= mating_score)
+            return mating_score;
+
+        int mated_score = score::kMated + root_dist;
+        alpha = std::max(mated_score, alpha);
+        if (beta <= mated_score)
+            return mated_score;
+    }
+
+    // TT lookup
+    bool hashHit = false;
+    {
+        hash_data e;
+        hashHit = tt_.fetch(pos.key(), e);
+        if (hashHit) {
+            ttm = e.move;
+            ttvalue = e.score;
+            tt_depth = e.depth;
+            tt_bound = e.bound;
+
+            if (ttvalue > score::kMate - 1000)
+                ttvalue = ttvalue - depth;
+            if (ttvalue < -(score::kMate - 1000))
+                ttvalue = ttvalue + depth;
+
+            if (!pvNode && e.depth >= depth) {
+                if ((e.bound == bound_exact) || (e.bound == bound_low && ttvalue >= beta) ||
+                    (e.bound == bound_high && ttvalue <= alpha)) {
+                    history_.update(pos.to_move(), ttm, (stack - 1)->curr_move, depth,
+                                    static_cast<int16_t>(ttvalue), quiets, stack->killers);
+                    return ttvalue;
+                }
+            }
+        }
+    }
+
+    // Static evaluation
+    const bool anyPawnsOn7th = pos.pawns_near_promotion();
+    const bool weHavePawnsOn7th = pos.pawns_on_7th();
+    (void)weHavePawnsOn7th;
+
+    int16_t static_eval_val;
+    if (ttvalue != score::kNegInf) {
+        static_eval_val = static_cast<int16_t>(ttvalue);
+    } else if ((stack - 2)->static_eval != score::kNegInf && !in_check &&
+               (stack - 2)->static_eval >= (stack - 1)->static_eval) {
+        static_eval_val = static_cast<int16_t>((stack - 2)->static_eval + 15);
+    } else if (!in_check) {
+        auto* sthread = search_threads_[thread_id];
+        float lm = lazy_eval_margin_search(depth, anyPawnsOn7th);
+        static_eval_val = static_cast<int16_t>(std::lround(sthread->evaluator->evaluate(pos, lm)));
+    } else {
+        static_eval_val = score::kNegInf;
+    }
+
+    stack->static_eval = static_eval_val;
+    bool hasStaticValue = static_eval_val != score::kNegInf;
+
+    // IIR: If we have no hash move at a PV or cut node, reduce depth.
+    if (depth >= 4 && ttm.type == static_cast<U8>(no_type) &&
+        (pvNode || (!pvNode && static_eval_val + 200 >= beta))) {
+        depth -= 1;
+    }
+
+    // Reverse futility pruning: if our static eval is so good that even after
+    // subtracting a margin we still beat beta, just return the static eval.
+    if (!in_check && !pvNode && depth <= 6 && !stack->null_search &&
+        static_eval_val - 80 * depth >= beta && static_eval_val < score::kMate - 100) {
+        return static_eval_val;
+    }
+
+    // Forward pruning conditions
+    const bool forward_prune =
+        (!in_check && !pvNode && (stack - 1)->curr_move.type == static_cast<U8>(quiet) &&
+         !stack->null_search && std::abs(alpha - beta) == 1 && hasStaticValue);
+
+    // Null move pruning
+    bool null_move_allowed =
+        (pos.to_move() == white ? pos.non_pawn_material<white>() : pos.non_pawn_material<black>());
+    int null_penalty = (depth >= 30) ? 4 : (depth >= 20) ? 6 : 8;
+
+    if (forward_prune && null_move_allowed && depth >= 6 &&
+        static_eval_val - null_penalty * (64 - depth) >= beta) {
+
+        int R = (depth >= 6 ? std::max(3, static_cast<int>(depth) / 2) : 2);
+        int ndepth = depth - R;
+
+        (stack + 1)->null_search = true;
+        pos.do_null_move();
+        int null_eval =
+            (ndepth <= 1 ? -qsearch<non_pv>(pos, -beta, -beta + 1, 0, stack + 1, thread_id)
+                         : -search<non_pv>(pos, -beta, -beta + 1, static_cast<U16>(ndepth),
+                                           stack + 1, thread_id));
+        pos.undo_null_move();
+        (stack + 1)->null_search = false;
+
+        if (null_eval >= beta) {
+            return null_eval;
+        } else {
+            Move tm = (stack + 1)->best_move;
+            if (tm.type == static_cast<U8>(capture) && beta - null_eval >= 500)
+                stack->threat_move = tm;
+        }
+    }
+
+    // Main search
+    U16 moves_searched = 0;
+    Moveorder mvs(pos, ttm, stack, &history_);
+    Move move;
+    Move pre_move = (stack - 1)->curr_move;
+    Move pre_pre_move = (stack - 2)->curr_move;
+    bool improving = stack->static_eval - (stack - 2)->static_eval >= 0;
+    auto to_mv = pos.to_move();
+    int SEE = 0;
+    bool skipQuiets = false;
+    bool rootMoves = root_node && pos.root_moves.size() > 4 && pos.root_moves[0].pv.size() > 4;
+
+    while (mvs.next_move(pos, move, pre_move, pre_pre_move, stack->threat_move, skipQuiets,
+                         rootMoves)) {
+        if (signals_.stop.load())
+            return score::kDraw;
+
+        if (move.type == static_cast<U8>(no_type) || !pos.is_legal(move))
+            continue;
+
+        // Move classification
+        auto hashOrKiller = (move == ttm) || (move == stack->killers[0]) ||
+                            (move == stack->killers[1]) || (move == stack->killers[2]) ||
+                            (move == stack->killers[3]);
+        auto isPromotion = pos.is_promotion(move.type);
+        auto isCapture = (move.type == static_cast<U8>(capture)) ||
+                         (move.type == static_cast<U8>(ep)) ||
+                         pos.is_cap_promotion(static_cast<Movetype>(move.type));
+        auto isQuiet = move.type == static_cast<U8>(Movetype::quiet);
+        auto isEvasion = in_check;
+        auto advancedPawnPush =
+            (pos.piece_on(static_cast<Square>(move.f)) == Piece::pawn) &&
+            (to_mv == white ? util::row(move.f) >= Row::r6 : util::row(move.f) <= Row::r3);
+        auto dangerousQuietCheck = isQuiet && pos.quiet_gives_dangerous_check(move);
+
+        // History pruning: skip quiet moves with terrible history at shallow depths
+        if (!pvNode && !in_check && depth <= 3 && !hashOrKiller && isQuiet &&
+            bestScore > score::kMatedMaxPly) {
+            int hist_score = history_.score(move, pos.to_move());
+            if (hist_score < -4096 * depth) {
+                continue;
+            }
+        }
+
+        // Skip captures with negative SEE
+        if (isCapture && !hashOrKiller && !pvNode && !isEvasion && !isPromotion &&
+            bestScore < alpha && depth <= 1 && moves_searched > 1 && (SEE = pos.see(move)) < 0)
+            continue;
+
+        // Singular extension: if the hash move is significantly better than
+        // all alternatives, extend it by 1 ply.
+        int singular_ext = 0;
+        if (!root_node && depth >= 8 && move == ttm && !stack->null_search &&
+            ttvalue != score::kNegInf && (tt_bound == bound_low || tt_bound == bound_exact) &&
+            tt_depth >= depth - 3) {
+            int singular_beta = ttvalue - 2 * depth;
+            int singular_depth = (depth - 1) / 2;
+
+            stack->null_search = true;
+            int singular_score = search<non_pv>(pos, singular_beta - 1, singular_beta,
+                                                static_cast<U16>(singular_depth), stack, thread_id);
+            stack->null_search = false;
+
+            if (singular_score < singular_beta) {
+                singular_ext = 1;
+            } else if (singular_beta >= beta) {
+                return singular_beta; // Multi-cut
+            }
+        }
+
+        pos.do_move(move);
+        stack->curr_move = move;
+
+        bool givesCheck = pos.in_check();
+        int extensions = std::max(givesCheck ? 1 : 0, singular_ext);
+        int reductions_val = 1;
+
+        // Reduce uninteresting quiet moves
+        if (!pvNode && !improving && !hashOrKiller && !isCapture && !isEvasion && !givesCheck &&
+            !isPromotion && !advancedPawnPush && depth <= 2 && bestScore <= alpha)
+            reductions_val += 1;
+
+        // Extend likely interesting quiet moves
+        auto threatResponse = (stack->threat_move.type != static_cast<U8>(no_type) &&
+                               stack->threat_move.f == move.t) &&
+                              isCapture;
+        if (!pvNode && !improving && !hashOrKiller && !isCapture && depth <= 2 &&
+            bestScore < alpha && bestScore > score::kMatedMaxPly &&
+            (dangerousQuietCheck || advancedPawnPush || threatResponse))
+            extensions += 1;
+
+        // Movecount pruning
+        skipQuiets = moves_searched >= static_cast<U16>(futility_move_count(improving, depth));
+
+        int newdepth = depth + extensions - reductions_val;
+        (stack + 1)->pv = nullptr;
+
+        int score_val = score::kNegInf;
+        if (moves_searched < 3) {
+            (stack + 1)->pv = pv_line;
+            (stack + 1)->pv[0].set(A1, A1, no_type);
+            score_val =
+                (newdepth <= 1
+                     ? -qsearch<Nodetype::pv>(pos, -beta, -alpha, 0, stack + 1, thread_id)
+                     : -search<Nodetype::pv>(pos, -beta, -alpha, static_cast<U16>(newdepth - 1),
+                                             stack + 1, thread_id));
+        } else {
+            int LMR = newdepth;
+            auto captureFollowup =
+                (stack - 1)->curr_move.type == static_cast<U8>(capture) && isCapture;
+            // Late move reduction
+            if (!threatResponse && !hashOrKiller && !dangerousQuietCheck && !captureFollowup &&
+                !advancedPawnPush && !isPromotion && !isEvasion && !givesCheck && !anyPawnsOn7th &&
+                depth >= 3 && bestScore <= alpha) {
+                unsigned R = reduction(pvNode, improving, depth, moves_searched);
+
+                // Reduce more for moves with bad history
+                int hist = history_.score(move, to_mv);
+                R += (hist < -2000) ? 1 : 0;
+
+                // Reduce more at cut nodes
+                if (!pvNode)
+                    R += 1;
+
+                // Reduce less for moves with good history
+                if (hist > 4000)
+                    R = std::max(0u, R - 1);
+
+                // Don't reduce into qsearch
+                LMR = std::max(1, newdepth - static_cast<int>(R));
+            }
+
+            score_val =
+                (LMR <= 1 ? -qsearch<non_pv>(pos, -alpha - 1, -alpha, 0, stack + 1, thread_id)
+                          : -search<non_pv>(pos, -alpha - 1, -alpha, static_cast<U16>(LMR - 1),
+                                            stack + 1, thread_id));
+
+            if (score_val > alpha) {
+                (stack + 1)->pv = pv_line;
+                (stack + 1)->pv[0].set(A1, A1, no_type);
+
+                score_val =
+                    (newdepth <= 1
+                         ? -qsearch<Nodetype::pv>(pos, -beta, -alpha, 0, stack + 1, thread_id)
+                         : -search<Nodetype::pv>(pos, -beta, -alpha, static_cast<U16>(newdepth - 1),
+                                                 stack + 1, thread_id));
+            }
+        }
+        ++moves_searched;
+
+        if (move.type == static_cast<U8>(Movetype::quiet))
+            quiets.emplace_back(move);
+
+        pos.undo_move(move);
+
+        if (signals_.stop.load())
+            return score::kDraw;
+
+        // Root move update
+        if (root_node) {
+            auto it = std::find(pos.root_moves.begin(), pos.root_moves.end(), move);
+            if (it != pos.root_moves.end()) {
+                auto& rm = *it;
+                if (moves_searched == 1 || score_val > alpha) {
+                    rm.score = static_cast<int16_t>(score_val);
+                    rm.selDepth = sel_depth_.load();
+                    rm.pv.resize(1);
+                    for (Move* m = (stack + 1)->pv; m; ++m) {
+                        if (m->f == m->t || m->type == static_cast<U8>(no_type))
+                            break;
+                        rm.pv.push_back(*m);
+                    }
+                } else {
+                    rm.score = score::kNegInf;
+                }
+            }
+        }
+
+        if (score_val > bestScore) {
+            bestScore = score_val;
+            best_move = move;
+            stack->best_move = move;
+
+            if (score_val >= beta) {
+                history_.update(pos.to_move(), best_move, (stack - 1)->curr_move, depth,
+                                static_cast<int16_t>(bestScore), quiets, stack->killers);
+                break;
+            }
+
+            if (score_val > alpha) {
+                if (pvNode)
+                    alpha = score_val;
+                if (pvNode && !root_node)
+                    update_pv(stack->pv, move, (stack + 1)->pv);
+            }
+        }
+    }
+
+    // Best move bonus
+    if (bestScore >= alpha && bestScore < beta && best_move.f != best_move.t) {
+        auto bonus = 2 * depth;
+        stack->best_move_history()[to_mv][best_move.f][best_move.t] += bonus;
+    }
+
+    if (moves_searched == 0) {
+        return (in_check ? score::kMated + root_dist : score::kDraw);
+    }
+
+    Bound bound = (bestScore >= beta                                        ? bound_low
+                   : pvNode && (best_move.type != static_cast<U8>(no_type)) ? bound_exact
+                                                                            : bound_high);
+    tt_.save(pos.key(), static_cast<U8>(depth), static_cast<U8>(bound), stack->ply, best_move,
+             static_cast<int16_t>(bestScore), pvNode);
+
+    return bestScore;
+}
+
+// ─── Quiescence search ──────────────────────────────────────────────────────
+
+template <Nodetype type>
+int SearchEngine::qsearch(position& p, int alpha, int beta, U16 depth, SearchNode* stack,
+                          int thread_id) {
+    if (signals_.stop.load())
+        return score::kDraw;
+
+    int best_score = score::kNegInf;
+    Move best_move{};
+    best_move.type = static_cast<U8>(no_type);
+
+    Move ttm{};
+    ttm.type = static_cast<U8>(no_type);
+    int ttvalue = score::kNegInf;
+    bool pv_type = type == Nodetype::pv;
+
+    stack->ply = (stack - 1)->ply + 1;
+    if (pv_type && sel_depth_.load() < stack->ply + 1)
+        sel_depth_++;
+    U16 root_dist = stack->ply;
+
+    bool in_check = p.in_check();
+    stack->in_check = in_check;
+
+    hash_data e;
+    e.depth = 0;
+    {
+        if (tt_.fetch(p.key(), e)) {
+            ttm = e.move;
+            ttvalue = e.score;
+
+            if (ttvalue > score::kMate - 1000)
+                ttvalue = ttvalue - depth;
+            if (ttvalue < -(score::kMate - 1000))
+                ttvalue = ttvalue + depth;
+
+            if (!pv_type) {
+                if ((e.bound == bound_exact) || (e.bound == bound_low && ttvalue >= beta) ||
+                    (e.bound == bound_high && ttvalue <= alpha)) {
+                    return ttvalue;
+                }
+            }
+        }
+    }
+
+    U16 qsdepth = in_check ? 1 : 0;
+    const bool anyPawnsOn7th = p.pawns_near_promotion();
+
+    if (!in_check) {
+        if (!pv_type && ttvalue != score::kNegInf && e.depth >= depth)
+            best_score = ttvalue;
+        else {
+            auto* sthread = search_threads_[thread_id];
+            float lm = lazy_eval_margin(qsdepth, anyPawnsOn7th);
+            best_score = static_cast<int>(std::lround(sthread->evaluator->evaluate(p, lm)));
+        }
+
+        // Stand pat
+        if (best_score >= beta)
+            return best_score;
+
+        // Delta pruning
+        int deltaCut = 910;
+        if (anyPawnsOn7th)
+            deltaCut += 775;
+        if (best_score < alpha - deltaCut)
+            return alpha;
+
+        if (pv_type && alpha < best_score)
+            alpha = best_score;
+    }
+
+    U16 moves_searched = 0;
+    QMoveorder mvs(p, ttm, stack, &history_);
+    Move move;
+    Move pre_move = (stack - 1)->curr_move;
+    Move pre_pre_move = (stack - 2)->curr_move;
+    Color to_mv = p.to_move();
+
+    while (mvs.next_move(p, move, pre_move, pre_pre_move, stack->threat_move, false)) {
+        if (signals_.stop.load())
+            return score::kDraw;
+
+        if (move.type == static_cast<U8>(no_type) || !p.is_legal(move))
+            continue;
+
+        auto hashOrKiller = (move == ttm) || (move == stack->killers[0]) ||
+                            (move == stack->killers[1]) || (move == stack->killers[2]) ||
+                            (move == stack->killers[3]);
+        auto isQuiet = move.type == static_cast<U8>(Movetype::quiet);
+
+        // Delta pruning for captures
+        if (!isQuiet && !in_check && !hashOrKiller) {
+            int idx = static_cast<int>(p.piece_on(static_cast<Square>(move.t)));
+            float capture_score = 0;
+            if (idx >= 0 && idx < static_cast<int>(kMaterialVals.size())) {
+                if (move.type == static_cast<U8>(Movetype::capture))
+                    capture_score = kMaterialVals[idx];
+                else if (move.type == static_cast<U8>(ep))
+                    capture_score = kMaterialVals[0];
+                else if (move.type == static_cast<U8>(capture_promotion_q))
+                    capture_score = kMaterialVals[idx] + kMaterialVals[queen];
+                else if (move.type == static_cast<U8>(capture_promotion_r))
+                    capture_score = kMaterialVals[idx] + kMaterialVals[rook];
+                else if (move.type == static_cast<U8>(capture_promotion_b))
+                    capture_score = kMaterialVals[idx] + kMaterialVals[bishop];
+                else if (move.type == static_cast<U8>(capture_promotion_n))
+                    capture_score = kMaterialVals[idx] + kMaterialVals[knight];
+            }
+            int margin = 200;
+            if (capture_score > 0 &&
+                (best_score + static_cast<int>(capture_score) + margin < alpha))
+                continue;
+            if (capture_score > 0 && (best_score - static_cast<int>(capture_score) - margin > beta))
+                continue;
+        }
+
+        if (p.see(move) < 0)
+            continue;
+
+        p.do_move(move);
+        p.adjust_qnodes(1);
+
+        int score_val = -qsearch<type>(p, -beta, -alpha, 0, stack + 1, thread_id);
+
+        ++moves_searched;
+        p.undo_move(move);
+
+        if (score_val > best_score) {
+            best_score = score_val;
+            best_move = move;
+            stack->best_move = move;
+
+            if (score_val >= beta)
+                break;
+
+            if (pv_type && score_val > alpha)
+                alpha = score_val;
+        }
+    }
+
+    if (moves_searched == 0 && in_check)
+        return score::kMated + root_dist;
+
+    Bound bound = (best_score >= beta                                        ? bound_low
+                   : pv_type && (best_move.type != static_cast<U8>(no_type)) ? bound_exact
+                                                                             : bound_high);
+    tt_.save(p.key(), qsdepth, static_cast<U8>(bound), stack->ply, best_move,
+             static_cast<int16_t>(best_score), pv_type);
+
+    return best_score;
+}
+
+// ─── PV update ──────────────────────────────────────────────────────────────
+
+void SearchEngine::update_pv(Move* root_pv, const Move& move, Move* child) {
+    for (*root_pv++ = move; child && root_pv && child->f != child->t;)
+        *root_pv++ = *child++;
+    root_pv->set(A1, A1, no_type);
+}
+
+// ─── PV readout ─────────────────────────────────────────────────────────────
+
+void SearchEngine::readout_pv(SearchNode* stack, const Rootmoves& mRoots, int eval, int alpha,
+                              int beta, U16 depth) {
+    std::unique_lock<std::mutex> lock(output_mutex_);
+
+    U64 nodes = 0;
+    for (auto& t : positions_) {
+        nodes += t->nodes();
+        nodes += t->qnodes();
+    }
+
+    int numLines = std::min(multi_pv_, static_cast<int>(mRoots.size()));
+    for (int i = 0; i < numLines; ++i) {
+        if (i >= static_cast<int>(mRoots.size()))
+            break;
+
+        std::string res;
+        for (auto& m : mRoots[i].pv) {
+            if (m.f == m.t || m.type == static_cast<U8>(no_type))
+                break;
+            res += std::string(uci::move_to_string(m)) + " ";
+        }
+
+        std::cout << "info"
+                  << " depth " << depth
+                  << (eval >= beta    ? " lowerbound"
+                      : eval <= alpha ? " upperbound"
+                                      : "")
+                  << " seldepth " << mRoots[i].selDepth << " multipv " << i << " score cp " << eval
+                  << " nodes " << nodes << " pv " << res << std::endl;
+    }
+}
+
+// ─── Node counting ──────────────────────────────────────────────────────────
+
+U64 SearchEngine::total_nodes() const {
+    U64 n = 0;
+    for (const auto& t : positions_)
+        n += t->nodes() + t->qnodes();
+    return n;
+}
+
+// ─── Explicit template instantiations ───────────────────────────────────────
+
+template int SearchEngine::search<root>(position&, int, int, U16, SearchNode*, int);
+template int SearchEngine::search<pv>(position&, int, int, U16, SearchNode*, int);
+template int SearchEngine::search<non_pv>(position&, int, int, U16, SearchNode*, int);
+
+template int SearchEngine::qsearch<pv>(position&, int, int, U16, SearchNode*, int);
+template int SearchEngine::qsearch<non_pv>(position&, int, int, U16, SearchNode*, int);
+
+} // namespace havoc

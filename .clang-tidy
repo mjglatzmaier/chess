@@ -1,0 +1,45 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  clang-analyzer-*,
+  cppcoreguidelines-avoid-goto,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-slicing,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  modernize-concat-nested-namespaces,
+  modernize-deprecated-headers,
+  modernize-make-shared,
+  modernize-make-unique,
+  modernize-redundant-void-arg,
+  modernize-use-auto,
+  modernize-use-default-member-init,
+  modernize-use-emplace,
+  modernize-use-equals-default,
+  modernize-use-equals-delete,
+  modernize-use-nodiscard,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-using,
+  performance-*,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-container-size-empty,
+  readability-implicit-bool-conversion,
+  readability-redundant-string-cstr,
+  readability-simplify-boolean-expr
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: 'include/havoc/.*\.hpp$'
+
+CheckOptions:
+  - key: modernize-use-auto.MinTypeNameLength
+    value: 5
+  - key: readability-implicit-bool-conversion.AllowPointerConditions
+    value: true
+  - key: readability-implicit-bool-conversion.AllowIntegerConditions
+    value: true

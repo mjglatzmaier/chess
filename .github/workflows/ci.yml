@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'feature/**']
+    paths: ['remake/**']
+  pull_request:
+    branches: [main, develop]
+    paths: ['remake/**']
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang-17
+            cxx: clang++-17
+          - os: macos-latest
+            compiler: appleclang
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+            cxx: cl
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install newer compilers on Ubuntu
+      - name: Install GCC 13 (Ubuntu)
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13
+
+      - name: Install Clang 17 (Ubuntu)
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'clang'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 17
+          sudo apt-get install -y clang-17
+
+      # Configure
+      - name: Configure (Unix)
+        if: matrix.os != 'windows-latest'
+        working-directory: remake
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DHAVOC_ENABLE_TESTS=ON
+          -DHAVOC_NATIVE=OFF
+
+      - name: Configure (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: remake
+        run: >
+          cmake -B build
+          -DHAVOC_ENABLE_TESTS=ON
+          -DHAVOC_NATIVE=OFF
+
+      # Build
+      - name: Build
+        working-directory: remake
+        run: cmake --build build --config Release --parallel
+
+      # Test
+      - name: Test
+        working-directory: remake/build
+        run: ctest --config Release --output-on-failure --parallel
+
+      # Debug build with sanitizers (Linux GCC only, to keep CI fast)
+      - name: Configure Debug + Sanitizers
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
+        working-directory: remake
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -B build-debug
+          -DCMAKE_BUILD_TYPE=Debug
+          -DHAVOC_ENABLE_TESTS=ON
+          -DHAVOC_ENABLE_SANITIZERS=ON
+          -DHAVOC_NATIVE=OFF
+
+      - name: Build Debug
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
+        working-directory: remake
+        run: cmake --build build-debug --config Debug --parallel
+
+      - name: Test Debug (ASan + UBSan)
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'gcc'
+        working-directory: remake/build-debug
+        run: ctest --config Debug --output-on-failure --parallel

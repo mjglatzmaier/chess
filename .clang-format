@@ -1,0 +1,60 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+TabWidth: 4
+UseTab: Never
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignOperands: Align
+AlignTrailingComments: true
+
+# Braces
+BreakBeforeBraces: Attach
+Cpp11BracedListStyle: true
+
+# Short forms
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+
+# Includes
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"havoc/'
+    Priority: 1
+  - Regex: '^<gtest/'
+    Priority: 3
+  - Regex: '^<'
+    Priority: 2
+  - Regex: '.*'
+    Priority: 4
+
+# Misc
+PointerAlignment: Left
+ReferenceAlignment: Left
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: Never
+
+# Namespaces
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# Penalties
+PenaltyBreakComment: 300
+PenaltyBreakString: 1000
+PenaltyReturnTypeOnItsOwnLine: 60
+
+# Language
+Language: Cpp
+Standard: c++20
