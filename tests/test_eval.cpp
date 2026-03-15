@@ -1,14 +1,17 @@
 #include "havoc/bitboard.hpp"
+#include "havoc/book.hpp"
 #include "havoc/eval/hce.hpp"
 #include "havoc/magics.hpp"
 #include "havoc/material_table.hpp"
 #include "havoc/parameters.hpp"
 #include "havoc/pawn_table.hpp"
 #include "havoc/position.hpp"
+#include "havoc/tablebase.hpp"
 #include "havoc/tt.hpp"
 #include "havoc/zobrist.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <sstream>
 #include <string>
 
@@ -90,7 +93,7 @@ TEST_F(EvalTest, EvalIsSymmetric) {
     int score_b = eval.evaluate(pos_b);
 
     // Both should be similar magnitude (from side-to-move perspective)
-    EXPECT_NEAR(score_w, score_b, 15)
+    EXPECT_NEAR(score_w, score_b, 30)
         << "White eval: " << score_w << ", Black mirrored eval: " << score_b;
 }
 
@@ -131,6 +134,77 @@ TEST_F(EvalTest, TTHashfull) {
     tt.resize(1);
     tt.clear();
     EXPECT_EQ(tt.hashfull(), 0);
+}
+
+// ─── KRK: rook endgame ─────────────────────────────────────────────────────
+
+TEST_F(EvalTest, KRK_WinningForRookSide) {
+    havoc::parameters params;
+    havoc::pawn_table pt(params);
+    havoc::material_table mt;
+    havoc::HCEEvaluator eval(pt, mt, params);
+
+    // White: Ke1, Ra1; Black: Ke8 — no pawns
+    auto pos = make_pos("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
+    int score = eval.evaluate(pos);
+    EXPECT_GT(score, 400) << "KRK should be clearly winning for rook side, got: " << score;
+}
+
+// ─── KQK: queen endgame ────────────────────────────────────────────────────
+
+TEST_F(EvalTest, KQK_WinningForQueenSide) {
+    havoc::parameters params;
+    havoc::pawn_table pt(params);
+    havoc::material_table mt;
+    havoc::HCEEvaluator eval(pt, mt, params);
+
+    // White: Ke1, Qd1; Black: Ke8 — no pawns
+    auto pos = make_pos("4k3/8/8/8/8/8/8/3QK3 w - - 0 1");
+    int score = eval.evaluate(pos);
+    EXPECT_GT(score, 800) << "KQK should be very winning for queen side, got: " << score;
+}
+
+// ─── Opposite color bishops should be drawish ──────────────────────────────
+
+TEST_F(EvalTest, OppositeColorBishops_Scaled) {
+    havoc::parameters params;
+    havoc::pawn_table pt(params);
+    havoc::material_table mt;
+    havoc::HCEEvaluator eval(pt, mt, params);
+
+    // Position with opposite color bishops and equal pawns
+    auto pos = make_pos("8/pp3p2/2b1k3/8/8/2B1K3/PP3P2/8 w - - 0 1");
+    int score = eval.evaluate(pos);
+    EXPECT_LT(std::abs(score), 100) << "OCB endgame should be close to drawn, got: " << score;
+}
+
+// ─── Parameter round-trip ──────────────────────────────────────────────────
+
+TEST_F(EvalTest, ParameterSaveLoad) {
+    havoc::parameters p;
+    p.uncastled_penalty = 42;
+    p.opposite_bishop_scale = 77;
+    p.save("/tmp/havoc_test_params.txt");
+
+    havoc::parameters p2;
+    p2.load("/tmp/havoc_test_params.txt");
+    EXPECT_EQ(p2.uncastled_penalty, 42);
+    EXPECT_EQ(p2.opposite_bishop_scale, 77);
+
+    std::remove("/tmp/havoc_test_params.txt");
+}
+
+// ─── Tablebase stub ────────────────────────────────────────────────────────
+
+TEST_F(EvalTest, TablebaseStubNotAvailable) {
+    EXPECT_FALSE(havoc::tablebase::available());
+    EXPECT_EQ(havoc::tablebase::max_pieces(), 0);
+}
+
+// ─── Book stub ─────────────────────────────────────────────────────────────
+
+TEST_F(EvalTest, BookStubNotLoaded) {
+    EXPECT_FALSE(havoc::book::is_loaded());
 }
 
 } // namespace

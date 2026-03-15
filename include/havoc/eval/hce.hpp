@@ -62,6 +62,9 @@ class HCEEvaluator : public IEvaluator {
     template <Color c> int eval_kpk(const position& p, einfo& ei);
     template <Color c> int eval_krrk(const position& p, einfo& ei);
     template <Color c> int eval_knbk(const position& p, einfo& ei);
+    template <Color c> int eval_krk(const position& p, einfo& ei);
+    template <Color c> int eval_kqk(const position& p, einfo& ei);
+    template <Color c> int eval_kbnk(const position& p, einfo& ei);
     template <Color c> bool trapped_rook(const position& p, einfo& ei, Square rs);
 
     // Endgame helpers

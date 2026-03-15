@@ -35,6 +35,15 @@ int16_t evaluate_material(const position& p, material_entry& e) {
     // Endgame classification
     if (total_eg == 0)
         e.endgame = EndgameType::KpK;
+    else if (total_eg == 1 && (eg_pieces[white][rook] == 1 || eg_pieces[black][rook] == 1))
+        e.endgame = EndgameType::KRK;
+    else if (total_eg == 1 && (eg_pieces[white][queen] == 1 || eg_pieces[black][queen] == 1))
+        e.endgame = EndgameType::KQK;
+    else if (total_eg == 2 && ((eg_pieces[white][bishop] == 1 && eg_pieces[white][knight] == 1 &&
+                                total[black] == 0) ||
+                               (eg_pieces[black][bishop] == 1 && eg_pieces[black][knight] == 1 &&
+                                total[white] == 0)))
+        e.endgame = EndgameType::KBNK;
     else if (total_eg == 2 && eg_pieces[white][rook] == 1 && eg_pieces[black][rook] == 1)
         e.endgame = EndgameType::KrrK;
     else if (total_eg == 2 && eg_pieces[white][bishop] == 1 && eg_pieces[black][knight] == 1)
