@@ -39,8 +39,8 @@ struct parameters {
 
     // Per-piece mobility curve scale factors (percentage: 100 = 1.0x)
     int knight_mobility_scale = 100;
-    int bishop_mobility_scale = 100;
-    int rook_mobility_scale = 100;
+    int bishop_mobility_scale = 98;
+    int rook_mobility_scale = 98;
 
     // Mobility tables (moved from hce.cpp anonymous namespace)
     std::array<int, 9> knight_mobility_table = {-50, -30, -15, -6, 2, 8, 13, 17, 20};
@@ -111,7 +111,7 @@ struct parameters {
     std::array<int, 6> material_value = {100, 300, 315, 480, 910, 20000};
 
     // Endgame scaling (out of 128; 128 = no scaling)
-    int opposite_bishop_scale = 64;
+    int opposite_bishop_scale = 24;
     int no_pawn_scale = 32;
     int minor_advantage_no_pawn_scale = 8;
 
