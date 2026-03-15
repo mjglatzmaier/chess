@@ -1,5 +1,5 @@
 /// @file texel_tune.cpp
-/// @brief Texel tuner: optimize evaluation parameters via coordinate descent.
+/// @brief Texel tuner with pre-parsed positions, multi-threaded eval, checkpointing.
 
 #include "havoc/bitboard.hpp"
 #include "havoc/eval/hce.hpp"
@@ -16,300 +16,195 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace havoc;
 
-struct TuningPosition {
-    std::string fen;
-    double result; // 1.0, 0.5, 0.0
-};
+struct TuningEntry { position pos; double result; };
 
-/// Sigmoid: maps centipawn eval to expected score in [0, 1].
-static double sigmoid(double eval, double K = 400.0) {
+static inline double sigmoid(double eval, double K) {
     return 1.0 / (1.0 + std::pow(10.0, -eval / K));
 }
 
 class TexelTuner {
-  public:
-    std::vector<TuningPosition> positions;
+public:
+    std::vector<TuningEntry> entries;
     parameters params;
+    double cached_K = 0.0;
+    int num_threads = 1;
 
     bool load_data(const std::string& filename) {
+        auto t0 = std::chrono::steady_clock::now();
         std::ifstream in(filename);
-        if (!in.is_open())
-            return false;
-
+        if (!in.is_open()) return false;
         std::string line;
+        uint64_t loaded = 0, skipped = 0;
         while (std::getline(in, line)) {
-            // Format: FEN c9 "result";
-            auto c9_pos = line.find(" c9 ");
-            if (c9_pos == std::string::npos)
-                continue;
-
-            std::string fen = line.substr(0, c9_pos);
-
-            auto q1 = line.find('"', c9_pos);
+            auto c9 = line.find(" c9 ");
+            if (c9 == std::string::npos) { ++skipped; continue; }
+            auto q1 = line.find('"', c9);
             auto q2 = line.find('"', q1 + 1);
-            if (q1 == std::string::npos || q2 == std::string::npos)
-                continue;
-
+            if (q1 == std::string::npos || q2 == std::string::npos) { ++skipped; continue; }
             double result = std::stod(line.substr(q1 + 1, q2 - q1 - 1));
-            positions.push_back({fen, result});
+            std::istringstream fs(line.substr(0, c9));
+            TuningEntry e; e.pos.setup(fs); e.result = result;
+            entries.push_back(std::move(e));
+            if (++loaded % 100000 == 0)
+                std::cout << "  Loaded " << loaded << " positions...\r" << std::flush;
         }
-
-        std::cout << "Loaded " << positions.size() << " positions" << std::endl;
-        return !positions.empty();
+        auto s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "Loaded " << loaded << " positions in " << (int)s
+                  << "s (" << skipped << " skipped)" << std::endl;
+        return !entries.empty();
     }
 
-    /// Compute mean squared error over all positions.
-    double compute_error(double K = 400.0) {
-        pawn_table pt(params);
-        material_table mt;
-        HCEEvaluator eval(pt, mt, params);
-
-        double total_error = 0.0;
-        for (const auto& tp : positions) {
-            std::istringstream fen(tp.fen);
-            position pos(fen);
-
-            int score = eval.evaluate(pos, -1); // full eval, no lazy margin
-            double predicted = sigmoid(static_cast<double>(score), K);
-            double diff = tp.result - predicted;
-            total_error += diff * diff;
-        }
-
-        return total_error / static_cast<double>(positions.size());
-    }
-
-    /// Find optimal K (scaling constant) via binary search.
-    double find_optimal_K() {
-        std::cout << "Finding optimal K..." << std::endl;
-        double lo = 50.0, hi = 800.0;
-        for (int i = 0; i < 20; ++i) {
-            double m1 = lo + (hi - lo) / 3.0;
-            double m2 = hi - (hi - lo) / 3.0;
-            double e1 = compute_error(m1);
-            double e2 = compute_error(m2);
-            if (e1 < e2)
-                hi = m2;
-            else
-                lo = m1;
-        }
-        double K = (lo + hi) / 2.0;
-        std::cout << "Optimal K = " << K << " (error = " << compute_error(K) << ")" << std::endl;
-        return K;
-    }
-
-    /// Batch gradient descent with momentum, learning rate decay, and parameter clamping.
-    void optimize(int iterations, TuneStage stage) {
-        double K = find_optimal_K();
-
-        auto tunable = params.all_params(stage);
-        const size_t N = tunable.size();
-
-        // Stage-appropriate hyperparameters
-        double learning_rate;
-        int perturbation;
-        double lr_decay;      // multiply LR by this each iteration
-        double momentum_beta; // exponential moving average factor for gradient
-        switch (stage) {
-        case TuneStage::category:
-            learning_rate = 8.0;
-            perturbation = 2;
-            lr_decay = 0.7;    // decay faster — few params, converges quick
-            momentum_beta = 0.5;
-            break;
-        case TuneStage::shape:
-            learning_rate = 3.0;
-            perturbation = 1;
-            lr_decay = 0.85;
-            momentum_beta = 0.7;
-            break;
-        case TuneStage::fine:
-            learning_rate = 1.5;
-            perturbation = 1;
-            lr_decay = 0.9;
-            momentum_beta = 0.8;
-            break;
-        }
-
-        // Parameter bounds: {name_prefix, min, max}
-        // Category scales should stay in [10, 200] to prevent zeroing out
-        // King danger divisor should stay positive
-        struct ParamBounds { int lo; int hi; };
-        auto get_bounds = [&](const std::string& name) -> ParamBounds {
-            if (name.find("category_scale") != std::string::npos) return {10, 200};
-            if (name.find("mobility_scale") != std::string::npos) return {10, 200};
-            if (name == "king_danger_divisor") return {64, 1024};
-            if (name.find("material_value") != std::string::npos) return {10, 30000};
-            if (name.find("_scale") != std::string::npos) return {1, 256};
-            return {-500, 500}; // general default
-        };
-
-        // Momentum: running average of gradients
-        std::vector<double> velocity(N, 0.0);
-
-        double current_error = compute_error(K);
-        std::cout << "\nStage " << static_cast<int>(stage) + 1
-                  << " | Initial error: " << current_error << std::endl;
-        std::cout << "Tunable parameters: " << N
-                  << " | LR: " << learning_rate
-                  << " | LR decay: " << lr_decay
-                  << " | Momentum: " << momentum_beta
-                  << " | Perturbation: ±" << perturbation << std::endl;
-
-        for (int iter = 0; iter < iterations; ++iter) {
-            auto iter_start = std::chrono::steady_clock::now();
-            std::cout << "\n=== Iteration " << (iter + 1)
-                      << " (lr=" << learning_rate << ") ===" << std::endl;
-
-            // Phase 1: Compute numerical gradient for every parameter
-            std::vector<double> gradient(N, 0.0);
-            std::vector<int> originals(N);
-
-            for (size_t i = 0; i < N; ++i)
-                originals[i] = *tunable[i].second;
-
-            for (size_t i = 0; i < N; ++i) {
-                int original = originals[i];
-
-                *tunable[i].second = original + perturbation;
-                double err_plus = compute_error(K);
-
-                *tunable[i].second = original - perturbation;
-                double err_minus = compute_error(K);
-
-                *tunable[i].second = original;
-
-                gradient[i] = (err_plus - err_minus) / (2.0 * perturbation);
+    double compute_error(double K) {
+        const size_t N = entries.size();
+        const int T = num_threads;
+        std::vector<double> errs(T, 0.0);
+        std::vector<std::thread> threads;
+        auto work = [&](int tid) {
+            pawn_table pt(params); material_table mt;
+            HCEEvaluator ev(pt, mt, params);
+            size_t a = (N * tid) / T, b = (N * (tid + 1)) / T;
+            double e = 0.0;
+            for (size_t i = a; i < b; ++i) {
+                double p = sigmoid((double)ev.evaluate(entries[i].pos, -1), K);
+                double d = entries[i].result - p;
+                e += d * d;
             }
+            errs[tid] = e;
+        };
+        for (int t = 0; t < T; ++t) threads.emplace_back(work, t);
+        for (auto& t : threads) t.join();
+        double tot = 0; for (auto x : errs) tot += x;
+        return tot / (double)N;
+    }
 
-            // Phase 2: Update velocity (momentum) and apply batch update
+    double find_optimal_K(bool force = false) {
+        if (cached_K > 0 && !force) {
+            std::cout << "Using cached K = " << cached_K << std::endl;
+            return cached_K;
+        }
+        std::cout << "Finding optimal K..." << std::flush;
+        auto t0 = std::chrono::steady_clock::now();
+        double lo = 50, hi = 800;
+        for (int i = 0; i < 15; ++i) {
+            double m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+            if (compute_error(m1) < compute_error(m2)) hi = m2; else lo = m1;
+        }
+        cached_K = (lo + hi) / 2;
+        auto s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << " K = " << cached_K << " (err=" << compute_error(cached_K)
+                  << ", " << (int)s << "s)" << std::endl;
+        return cached_K;
+    }
+
+    void optimize(int iters, TuneStage stage, const std::string& ckpt) {
+        double K = find_optimal_K();
+        auto tunable = params.all_params(stage);
+        const size_t NP = tunable.size();
+        double lr, lr_decay, mom; int pert;
+        switch (stage) {
+        case TuneStage::category: lr=8; pert=2; lr_decay=0.7; mom=0.5; break;
+        case TuneStage::shape:    lr=3; pert=1; lr_decay=0.85; mom=0.7; break;
+        case TuneStage::fine:     lr=1.5; pert=1; lr_decay=0.9; mom=0.8; break;
+        }
+        struct Bounds { int lo, hi; };
+        auto bounds = [](const std::string& n) -> Bounds {
+            if (n.find("category_scale") != std::string::npos) return {10, 200};
+            if (n.find("mobility_scale") != std::string::npos) return {10, 200};
+            if (n == "king_danger_divisor") return {64, 1024};
+            if (n.find("material_value") != std::string::npos) return {10, 30000};
+            if (n.find("_scale") != std::string::npos) return {1, 256};
+            return {-500, 500};
+        };
+        std::vector<double> vel(NP, 0.0);
+        double cur_err = compute_error(K);
+        std::cout << "\nStage " << (int)stage+1 << " | Error: " << cur_err
+                  << " | Params: " << NP << " | LR: " << lr
+                  << " | Threads: " << num_threads << std::endl;
+
+        for (int it = 0; it < iters; ++it) {
+            auto t0 = std::chrono::steady_clock::now();
+            std::cout << "\n=== Iteration " << it+1 << " (lr=" << lr << ") ===" << std::endl;
+            std::vector<double> grad(NP, 0);
+            std::vector<int> orig(NP);
+            for (size_t i = 0; i < NP; ++i) orig[i] = *tunable[i].second;
+            for (size_t i = 0; i < NP; ++i) {
+                *tunable[i].second = orig[i] + pert;
+                double ep = compute_error(K);
+                *tunable[i].second = orig[i] - pert;
+                double em = compute_error(K);
+                *tunable[i].second = orig[i];
+                grad[i] = (ep - em) / (2.0 * pert);
+                if (NP > 20 && (i+1) % 10 == 0)
+                    std::cout << "  gradient: " << i+1 << "/" << NP << "\r" << std::flush;
+            }
+            if (NP > 20) std::cout << "  gradient: " << NP << "/" << NP << "    " << std::endl;
+
             int updated = 0;
-            for (size_t i = 0; i < N; ++i) {
-                // Momentum: smooth the gradient over iterations
-                velocity[i] = momentum_beta * velocity[i] + (1.0 - momentum_beta) * gradient[i];
-
-                int delta = static_cast<int>(-learning_rate * velocity[i] * 1e6);
-
-                // Clamp step size
-                int max_step = (stage == TuneStage::category) ? 20 : 8;
-                delta = std::max(-max_step, std::min(max_step, delta));
-
+            for (size_t i = 0; i < NP; ++i) {
+                vel[i] = mom * vel[i] + (1 - mom) * grad[i];
+                int delta = (int)(-lr * vel[i] * 1e6);
+                int ms = (stage == TuneStage::category) ? 20 : 8;
+                delta = std::max(-ms, std::min(ms, delta));
                 if (delta != 0) {
-                    int new_val = originals[i] + delta;
-
-                    // Clamp to parameter bounds
-                    auto bounds = get_bounds(tunable[i].first);
-                    new_val = std::max(bounds.lo, std::min(bounds.hi, new_val));
-                    delta = new_val - originals[i];
-
-                    if (delta != 0) {
-                        *tunable[i].second = new_val;
+                    int nv = orig[i] + delta;
+                    auto b = bounds(tunable[i].first);
+                    nv = std::max(b.lo, std::min(b.hi, nv));
+                    if (nv != orig[i]) {
+                        *tunable[i].second = nv;
                         ++updated;
-                        std::cout << "  " << tunable[i].first << ": " << originals[i]
-                                  << " -> " << new_val
-                                  << " (grad: " << gradient[i]
-                                  << ", vel: " << velocity[i] << ")" << std::endl;
+                        std::cout << "  " << tunable[i].first << ": " << orig[i] << " -> " << nv
+                                  << " (g:" << grad[i] << " v:" << vel[i] << ")" << std::endl;
                     }
                 }
             }
+            double ne = compute_error(K);
+            if (ne >= cur_err) {
+                std::cout << "  Reverted (" << cur_err << "->" << ne << "), halving LR" << std::endl;
+                for (size_t i = 0; i < NP; ++i) *tunable[i].second = orig[i];
+                lr *= 0.5; for (auto& v : vel) v *= 0.5;
+            } else { cur_err = ne; lr *= lr_decay; }
 
-            double new_error = compute_error(K);
-
-            // If error got worse, revert and halve learning rate
-            if (new_error >= current_error) {
-                std::cout << "  Error increased (" << current_error << " -> " << new_error
-                          << "), reverting and halving LR" << std::endl;
-                for (size_t i = 0; i < N; ++i)
-                    *tunable[i].second = originals[i];
-                learning_rate *= 0.5;
-                // Also dampen velocity to avoid overshooting again
-                for (auto& v : velocity) v *= 0.5;
-                new_error = current_error;
-            } else {
-                current_error = new_error;
-                // Decay learning rate
-                learning_rate *= lr_decay;
-            }
-
-            auto iter_elapsed = std::chrono::steady_clock::now() - iter_start;
-            double secs = std::chrono::duration<double>(iter_elapsed).count();
-            std::cout << "Updated " << updated << " / " << N
-                      << " params. Error: " << current_error
-                      << "  (" << static_cast<int>(secs) << "s)" << std::endl;
-
-            if (updated == 0) {
-                std::cout << "Converged!" << std::endl;
-                break;
-            }
+            auto s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::cout << "Updated " << updated << "/" << NP << " Error: " << cur_err
+                      << " (" << (int)s << "s)" << std::endl;
+            if (!ckpt.empty()) { params.save(ckpt); std::cout << "  Checkpoint: " << ckpt << std::endl; }
+            if (updated == 0) { std::cout << "Converged!" << std::endl; break; }
         }
     }
 };
 
-static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [options]\n"
-              << "  --data FILE       Input EPD training data (default: training_data.epd)\n"
-              << "  --params FILE     Initial parameters file (optional)\n"
-              << "  --output FILE     Output tuned parameters (default: tuned_params.txt)\n"
-              << "  --iterations N    Tuning iterations (default: 5)\n"
-              << "  --stage N         Tuning stage: 1=category, 2=shape, 3=fine (default: 2)\n";
-}
-
 int main(int argc, char* argv[]) {
-    std::string data_file = "training_data.epd";
-    std::string params_file;
-    std::string output_file = "tuned_params.txt";
-    int iterations = 5;
-    int stage_num = 2;
-
+    std::string data = "training_data.epd", pfile, out = "tuned_params.txt";
+    int iters = 5, stg = 2, thr = (int)std::thread::hardware_concurrency();
+    double fK = 0;
     for (int i = 1; i < argc; ++i) {
-        std::string key = argv[i];
-        if ((key == "--data" || key == "-d") && i + 1 < argc)
-            data_file = argv[++i];
-        else if ((key == "--params" || key == "-p") && i + 1 < argc)
-            params_file = argv[++i];
-        else if ((key == "--output" || key == "-o") && i + 1 < argc)
-            output_file = argv[++i];
-        else if ((key == "--iterations" || key == "-i") && i + 1 < argc)
-            iterations = std::stoi(argv[++i]);
-        else if ((key == "--stage" || key == "-s") && i + 1 < argc)
-            stage_num = std::stoi(argv[++i]);
-        else if (key == "--help" || key == "-h") {
-            print_usage(argv[0]);
-            return 0;
+        std::string k = argv[i];
+        if ((k=="--data"||k=="-d") && i+1<argc) data = argv[++i];
+        else if ((k=="--params"||k=="-p") && i+1<argc) pfile = argv[++i];
+        else if ((k=="--output"||k=="-o") && i+1<argc) out = argv[++i];
+        else if ((k=="--iterations"||k=="-i") && i+1<argc) iters = std::stoi(argv[++i]);
+        else if ((k=="--stage"||k=="-s") && i+1<argc) stg = std::stoi(argv[++i]);
+        else if (k=="--K" && i+1<argc) fK = std::stod(argv[++i]);
+        else if ((k=="--threads"||k=="-t") && i+1<argc) thr = std::stoi(argv[++i]);
+        else if (k=="--help"||k=="-h") {
+            std::cerr << "Usage: " << argv[0] << " --data FILE [--params FILE] [--output FILE] "
+                      << "[--iterations N] [--stage 1|2|3] [--K val] [--threads N]\n"; return 0;
         }
     }
-
-    TuneStage stage = (stage_num == 1   ? TuneStage::category
-                       : stage_num == 3 ? TuneStage::fine
-                                        : TuneStage::shape);
-
-    bitboards::init();
-    magics::init();
-    zobrist::init();
-
-    TexelTuner tuner;
-
-    if (!params_file.empty()) {
-        if (tuner.params.load(params_file))
-            std::cout << "Loaded initial params from " << params_file << std::endl;
-        else
-            std::cerr << "Warning: failed to load params from " << params_file << std::endl;
-    }
-
-    if (!tuner.load_data(data_file)) {
-        std::cerr << "Failed to load training data from " << data_file << std::endl;
-        return 1;
-    }
-
-    tuner.optimize(iterations, stage);
-
-    if (tuner.params.save(output_file))
-        std::cout << "\nSaved tuned parameters to " << output_file << std::endl;
-    else
-        std::cerr << "\nFailed to save parameters to " << output_file << std::endl;
-
+    auto stage = (stg==1 ? TuneStage::category : stg==3 ? TuneStage::fine : TuneStage::shape);
+    bitboards::init(); magics::init(); zobrist::init();
+    TexelTuner tuner; tuner.num_threads = std::max(1, thr);
+    if (!pfile.empty() && tuner.params.load(pfile))
+        std::cout << "Loaded params from " << pfile << std::endl;
+    if (!tuner.load_data(data)) { std::cerr << "Failed to load " << data << std::endl; return 1; }
+    if (fK > 0) { tuner.cached_K = fK; std::cout << "Fixed K = " << fK << std::endl; }
+    tuner.optimize(iters, stage, out);
+    tuner.params.save(out);
+    std::cout << "\nSaved to " << out << std::endl;
     return 0;
 }
