@@ -46,6 +46,9 @@ set(HAVOC_CORE_SOURCES
     src/thread_pool.cpp
     src/search.cpp
     src/uci.cpp
+    src/parameters.cpp
+    src/tablebase.cpp
+    src/book.cpp
 )
 
 add_library(havoc_core STATIC ${HAVOC_CORE_SOURCES})

@@ -4,6 +4,8 @@
 /// @brief Evaluation parameters / tuning constants for the HCE evaluator.
 
 #include <array>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace havoc {
@@ -16,6 +18,12 @@ struct parameters {
 
     // Mobility scaling (indexed by Piece enum)
     std::vector<int> mobility_scaling{1, 1, 1, 1, 1};
+
+    // Mobility tables (moved from hce.cpp anonymous namespace)
+    std::array<int, 9> knight_mobility_table = {-50, -30, -15, -6, 2, 8, 13, 17, 20};
+    std::array<int, 15> bishop_mobility_table = {-50, -30, -15, -6, 2,  8,  13, 17,
+                                                 20,  22,  24,  25, 26, 27, 28};
+    std::array<int, 15> rook_mobility_table = {0, 1, 2, 3, 5, 6, 8, 9, 10, 11, 13, 14, 15, 17, 18};
 
     // Square attack bonuses (pawn, knight, bishop, rook, queen)
     std::vector<int> square_attks{7, 4, 3, 2, 1};
@@ -76,6 +84,17 @@ struct parameters {
     static constexpr int passed_pawn_bonus = 2;
     static constexpr int semi_open_pawn_penalty = 1;
 
+    // Material values
+    std::array<int, 6> material_value = {100, 300, 315, 480, 910, 20000};
+
+    // Endgame scaling (out of 128; 128 = no scaling)
+    int opposite_bishop_scale = 64;
+    int no_pawn_scale = 32;
+    int minor_advantage_no_pawn_scale = 8;
+
+    // Passed pawn rank bonuses
+    std::array<int, 4> passed_pawn_rank_bonus = {0, 45, 90, 180};
+
     // Move ordering
     static constexpr int counter_move_bonus = 5;
     static constexpr int threat_evasion_bonus = 2;
@@ -88,6 +107,13 @@ struct parameters {
         2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4,
         4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1,
     };
+
+    // Parameter serialization
+    bool load(const std::string& filename);
+    bool save(const std::string& filename) const;
+
+    /// Returns all tunable params as name/pointer pairs for the tuner.
+    std::vector<std::pair<std::string, int*>> all_params();
 };
 
 } // namespace havoc

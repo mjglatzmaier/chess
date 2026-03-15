@@ -538,6 +538,10 @@ int SearchEngine::search(position& pos, int alpha, int beta, U16 depth, SearchNo
         (stack + 1)->pv = nullptr;
 
         int score_val = score::kNegInf;
+        // PVS full-window threshold: give first N moves a full window before
+        // switching to null-window searches. Textbook PVS uses < 1, but with
+        // weaker move ordering < 3 avoids costly re-searches.
+        // TODO: revisit after Texel tuning improves move ordering (try < 2 or < 1)
         if (moves_searched < 3) {
             (stack + 1)->pv = pv_line;
             (stack + 1)->pv[0].set(A1, A1, no_type);

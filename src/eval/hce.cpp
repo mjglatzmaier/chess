@@ -16,21 +16,6 @@ namespace havoc {
 
 namespace {
 
-inline int knight_mobility(unsigned n) {
-    constexpr int table[9] = {-50, -30, -15, -6, 2, 8, 13, 17, 20};
-    return (n < 9) ? table[n] : 20;
-}
-
-inline int bishop_mobility(unsigned n) {
-    constexpr int table[15] = {-50, -30, -15, -6, 2, 8, 13, 17, 20, 22, 24, 25, 26, 27, 28};
-    return (n < 15) ? table[n] : 28;
-}
-
-inline int rook_mobility(unsigned n) {
-    constexpr int table[15] = {0, 1, 2, 3, 5, 6, 8, 9, 10, 11, 13, 14, 15, 17, 18};
-    return (n < 15) ? table[n] : 20;
-}
-
 inline bool is_pawnless_endgame(const position& p) {
     return (p.get_pieces<white, pawn>() | p.get_pieces<black, pawn>()) == 0ULL;
 }
@@ -91,6 +76,15 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
         case KrrK:
             score += eval_krrk<white>(p, ei) - eval_krrk<black>(p, ei);
             break;
+        case KRK:
+            score += eval_krk<white>(p, ei) - eval_krk<black>(p, ei);
+            break;
+        case KQK:
+            score += eval_kqk<white>(p, ei) - eval_kqk<black>(p, ei);
+            break;
+        case KBNK:
+            score += eval_kbnk<white>(p, ei) - eval_kbnk<black>(p, ei);
+            break;
         default:
             break;
         }
@@ -109,6 +103,28 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
 
     score += eval_threats<white>(p, ei) - eval_threats<black>(p, ei);
     score += eval_space<white>(p, ei) - eval_space<black>(p, ei);
+
+    // Endgame scaling
+    int scale = 128;
+
+    // Opposite-color bishops → drawish
+    bool ocb = ei.bishop_colors[white][0] && ei.bishop_colors[black][1] &&
+               !ei.bishop_colors[white][1] && !ei.bishop_colors[black][0];
+    bool ocb2 = ei.bishop_colors[white][1] && ei.bishop_colors[black][0] &&
+                !ei.bishop_colors[white][0] && !ei.bishop_colors[black][1];
+    if (ocb || ocb2)
+        scale = std::min(scale, params_.opposite_bishop_scale);
+
+    // No pawns with small material advantage → likely drawn
+    if (is_pawnless_endgame(p) && std::abs(score) < 400)
+        scale = std::min(scale, params_.no_pawn_scale);
+
+    // Single minor piece advantage with no pawns → near draw
+    if (is_pawnless_endgame(p) && std::abs(ei.me->score) <= 315 && std::abs(ei.me->score) > 0)
+        scale = std::min(scale, params_.minor_advantage_no_pawn_scale);
+
+    if (scale != 128)
+        score = (score * scale) / 128;
 
     int side_to_move = (p.to_move() == white) ? 1 : -1;
     return side_to_move * (score + static_cast<int>(params_.tempo));
@@ -156,7 +172,11 @@ template <Color c> int HCEEvaluator::eval_knights(const position& p, einfo& ei) 
         ei.piece_attacks[c][knight] |= mvs;
         if (!(sq_bb & p.pinned<c>())) {
             U64 mobility = (mvs & ei.empty) & (~ei.pe->attacks[them]);
-            score += params_.mobility_scaling[knight] * knight_mobility(bits::count(mobility));
+            unsigned cnt = bits::count(mobility);
+            int mob = (cnt < params_.knight_mobility_table.size())
+                          ? params_.knight_mobility_table[cnt]
+                          : params_.knight_mobility_table.back();
+            score += params_.mobility_scaling[knight] * mob;
         }
 
         // Outpost
@@ -245,8 +265,11 @@ template <Color c> int HCEEvaluator::eval_bishops(const position& p, einfo& ei) 
         ei.piece_attacks[c][bishop] |= mvs;
         U64 mobility = (mvs & ei.empty) & (~ei.pe->attacks[them]);
 
-        int mobility_score =
-            params_.mobility_scaling[bishop] * bishop_mobility(bits::count(mobility));
+        unsigned mob_cnt = bits::count(mobility);
+        int mob_val = (mob_cnt < params_.bishop_mobility_table.size())
+                          ? params_.bishop_mobility_table[mob_cnt]
+                          : params_.bishop_mobility_table.back();
+        int mobility_score = params_.mobility_scaling[bishop] * mob_val;
         if ((sq_bb & p.pinned<c>()) && mobility_score > 0)
             mobility_score /= params_.pinned_scaling[bishop];
 
@@ -339,7 +362,10 @@ template <Color c> int HCEEvaluator::eval_rooks(const position& p, einfo& ei) {
         U64 mobility = (mvs & ei.empty) & (~ei.pe->attacks[them]);
 
         int free_sqs = bits::count(mobility);
-        int mobility_score = params_.mobility_scaling[rook] * rook_mobility(free_sqs);
+        int mob_r = (static_cast<unsigned>(free_sqs) < params_.rook_mobility_table.size())
+                        ? params_.rook_mobility_table[free_sqs]
+                        : params_.rook_mobility_table.back();
+        int mobility_score = params_.mobility_scaling[rook] * mob_r;
 
         if (sq_bb & p.pinned<c>())
             mobility_score /= params_.pinned_scaling[rook];
@@ -464,11 +490,15 @@ template <Color c> int HCEEvaluator::eval_king(const position& p, einfo& ei) {
 
         if (unsafe_bb) {
             mvs &= ~unsafe_bb;
-            int num_attackers = 0;
-            for (int j = 1; j < 5; ++j)
-                num_attackers += static_cast<int>(ei.kattackers[them][j]);
 
-            score -= 2 * params_.attacker_weight[std::min(num_attackers, 4)];
+            // Quadratic king safety: concentrated attacks are exponentially dangerous
+            int danger_score = 0;
+            for (int j = 1; j < 5; ++j)
+                danger_score +=
+                    static_cast<int>(ei.kattackers[them][j]) * params_.attacker_weight[j];
+
+            score -= (danger_score * danger_score) / 256;
+
             score += params_.king_safe_sqs[std::min(7, bits::count(mvs))];
 
             // Attack combinations
@@ -1122,6 +1152,87 @@ template <Color c> int HCEEvaluator::eval_knbk(const position& p, einfo& ei) {
     return score;
 }
 
+// ─── eval_krk (King + Rook vs King) ─────────────────────────────────────────
+
+template <Color c> int HCEEvaluator::eval_krk(const position& p, einfo& /*ei*/) {
+    constexpr Color them = (c == white ? black : white);
+
+    // Only score for the side that has the rook
+    if (p.number_of(c, rook) == 0)
+        return 0;
+
+    Square enemy_king = p.king_square(them);
+    Square our_king = p.king_square(c);
+    int ek_row = util::row(enemy_king);
+    int ek_col = util::col(enemy_king);
+
+    // Distance from center (higher = on edge = good for us)
+    int center_dist = std::max(std::abs(ek_row - 3), std::abs(ek_col - 3));
+    // King proximity (closer = better for mating)
+    int king_dist = util::row_dist(our_king, enemy_king) + util::col_dist(our_king, enemy_king);
+
+    return 10 * center_dist - 5 * king_dist + 500;
+}
+
+// ─── eval_kqk (King + Queen vs King) ────────────────────────────────────────
+
+template <Color c> int HCEEvaluator::eval_kqk(const position& p, einfo& /*ei*/) {
+    constexpr Color them = (c == white ? black : white);
+
+    if (p.number_of(c, queen) == 0)
+        return 0;
+
+    Square enemy_king = p.king_square(them);
+    Square our_king = p.king_square(c);
+    int ek_row = util::row(enemy_king);
+    int ek_col = util::col(enemy_king);
+
+    // Drive enemy king to edge
+    int center_dist = std::max(std::abs(ek_row - 3), std::abs(ek_col - 3));
+    int king_dist = util::row_dist(our_king, enemy_king) + util::col_dist(our_king, enemy_king);
+
+    return 15 * center_dist - 5 * king_dist + 900;
+}
+
+// ─── eval_kbnk (King + Bishop + Knight vs King) ─────────────────────────────
+
+template <Color c> int HCEEvaluator::eval_kbnk(const position& p, einfo& /*ei*/) {
+    constexpr Color them = (c == white ? black : white);
+
+    if (p.number_of(c, bishop) == 0 || p.number_of(c, knight) == 0)
+        return 0;
+
+    Square enemy_king = p.king_square(them);
+    Square our_king = p.king_square(c);
+    Square bishop_sq = p.squares_of<c, bishop>()[0];
+    int ek_row = util::row(enemy_king);
+    int ek_col = util::col(enemy_king);
+
+    // Determine if bishop is on light or dark square
+    bool light_bishop = (bitboards::squares[bishop_sq] & bitboards::colored_sqs[white]) != 0ULL;
+
+    // Drive enemy king to correct corner (same color as bishop)
+    // Light bishop → a1(light) or h8(light); Dark bishop → a8(dark) or h1(dark)
+    int dist_a1 = std::max(ek_row, ek_col);         // distance to A1 corner
+    int dist_h8 = std::max(7 - ek_row, 7 - ek_col); // distance to H8 corner
+    int dist_a8 = std::max(7 - ek_row, ek_col);     // distance to A8 corner
+    int dist_h1 = std::max(ek_row, 7 - ek_col);     // distance to H1 corner
+
+    int corner_dist;
+    if (light_bishop) {
+        // Drive to a1 or h8 (light corners)
+        corner_dist = std::min(dist_a1, dist_h8);
+    } else {
+        // Drive to a8 or h1 (dark corners)
+        corner_dist = std::min(dist_a8, dist_h1);
+    }
+
+    int king_dist = util::row_dist(our_king, enemy_king) + util::col_dist(our_king, enemy_king);
+
+    // Penalty for enemy king being far from correct corner, bonus for close kings
+    return 20 * (3 - corner_dist) - 5 * king_dist + 400;
+}
+
 // ─── Explicit template instantiation ────────────────────────────────────────
 
 template int HCEEvaluator::eval_pawns<white>(const position&, einfo&);
@@ -1148,6 +1259,12 @@ template int HCEEvaluator::eval_krrk<white>(const position&, einfo&);
 template int HCEEvaluator::eval_krrk<black>(const position&, einfo&);
 template int HCEEvaluator::eval_knbk<white>(const position&, einfo&);
 template int HCEEvaluator::eval_knbk<black>(const position&, einfo&);
+template int HCEEvaluator::eval_krk<white>(const position&, einfo&);
+template int HCEEvaluator::eval_krk<black>(const position&, einfo&);
+template int HCEEvaluator::eval_kqk<white>(const position&, einfo&);
+template int HCEEvaluator::eval_kqk<black>(const position&, einfo&);
+template int HCEEvaluator::eval_kbnk<white>(const position&, einfo&);
+template int HCEEvaluator::eval_kbnk<black>(const position&, einfo&);
 template bool HCEEvaluator::trapped_rook<white>(const position&, einfo&, Square);
 template bool HCEEvaluator::trapped_rook<black>(const position&, einfo&, Square);
 template bool HCEEvaluator::has_opposition<white>(const position&, einfo&);

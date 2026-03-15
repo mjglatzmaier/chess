@@ -1,7 +1,9 @@
 #include "havoc/uci.hpp"
 
+#include "havoc/book.hpp"
 #include "havoc/movegen.hpp"
 #include "havoc/position.hpp"
+#include "havoc/tablebase.hpp"
 #include "havoc/version.hpp"
 
 #include <algorithm>
@@ -65,6 +67,14 @@ bool parse_command(const std::string& input, SearchEngine& engine, position& uci
                 engine.set_threads(std::stoi(cmd));
                 break;
             }
+            if (cmd == "syzygypath" && instream >> cmd && instream >> cmd) {
+                havoc::tablebase::init(cmd);
+                break;
+            }
+            if (cmd == "bookfile" && instream >> cmd && instream >> cmd) {
+                havoc::book::load(cmd);
+                break;
+            }
         } else if (cmd == "d") {
             uci_pos.print();
             std::cout << "position hash key: " << uci_pos.key() << std::endl;
@@ -122,6 +132,8 @@ bool parse_command(const std::string& input, SearchEngine& engine, position& uci
             std::cout << "id author " << ENGINE_AUTHOR << std::endl;
             std::cout << "option name Threads type spin default 1 min 1 max 1024" << std::endl;
             std::cout << "option name Hash type spin default 1024 min 1 max 33554432" << std::endl;
+            std::cout << "option name SyzygyPath type string default <empty>" << std::endl;
+            std::cout << "option name BookFile type string default <empty>" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "bench") {
             static const std::vector<std::string> bench_fens = {
