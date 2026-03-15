@@ -19,14 +19,16 @@ enum class TuneStage {
 
 struct parameters {
     // ── Category-level scale factors (percentage: 100 = 1.0x) ───────────────
-    int sq_score_category_scale = 100;
+    // These were calibrated via stage 1 Texel tuning against 327K positions.
+    // The values below are the "new 100%" — further tuning adjusts from here.
+    int sq_score_category_scale = 10;
     int mobility_category_scale = 100;
-    int king_safety_category_scale = 100;
-    int threat_category_scale = 100;
-    int passed_pawn_category_scale = 100;
-    int pawn_structure_category_scale = 100;
-    int space_category_scale = 100;
-    int king_danger_divisor = 256;
+    int king_safety_category_scale = 42;
+    int threat_category_scale = 10;
+    int passed_pawn_category_scale = 10;
+    int pawn_structure_category_scale = 78;
+    int space_category_scale = 76;
+    int king_danger_divisor = 276;
     int tempo = 0; // centipawns, side-to-move advantage. Tuned in stage 2 only.
 
     // Piece-square score scaling (indexed by Piece enum)
