@@ -31,49 +31,102 @@ from config import TrainingConfig, MODEL_CONFIGS
 
 
 class ChessDataset(Dataset):
-    """Load training data from .npz chunks."""
+    """Load training data from .npz chunks — lazy mode for large datasets."""
 
-    def __init__(self, data_dir: str):
-        self.boards = []
-        self.values = []
+    def __init__(self, data_dir: str, lazy: bool = False):
+        self.data_dir = data_dir
+        self.lazy = lazy
 
         # Load metadata
         meta_path = os.path.join(data_dir, "metadata.npz")
         if os.path.exists(meta_path):
             meta = dict(np.load(meta_path))
-            num_chunks = int(meta["num_chunks"])
-            has_policy = bool(meta.get("has_policy", False))
-            print(f"Loading {num_chunks} chunks from {data_dir}...")
+            self.num_chunks = int(meta["num_chunks"])
+            self.has_policy = bool(meta.get("has_policy", False))
         else:
-            num_chunks = 9999
-            has_policy = False
+            self.num_chunks = len(list(Path(data_dir).glob("chunk_*.npz")))
+            self.has_policy = False
 
-        # Load all chunks into memory
-        policies = []
-        for i in range(num_chunks):
-            chunk_path = os.path.join(data_dir, f"chunk_{i:04d}.npz")
-            if not os.path.exists(chunk_path):
+        # Discover actual chunk files and sizes
+        self.chunk_paths = []
+        self.chunk_sizes = []
+        self.cumulative_sizes = []
+        total = 0
+
+        for i in range(self.num_chunks):
+            path = os.path.join(data_dir, f"chunk_{i:04d}.npz")
+            if not os.path.exists(path):
                 break
-            data = np.load(chunk_path)
-            self.boards.append(data["boards"])
-            self.values.append(data["values"])
-            if "policies" in data:
-                policies.append(data["policies"])
+            self.chunk_paths.append(path)
+            # Peek at chunk size without loading arrays
+            with np.load(path) as data:
+                sz = len(data["values"])
+            self.chunk_sizes.append(sz)
+            total += sz
+            self.cumulative_sizes.append(total)
 
-        self.boards = np.concatenate(self.boards, axis=0)
-        self.values = np.concatenate(self.values, axis=0)
-        self.policies = np.concatenate(policies, axis=0) if policies else None
-        print(f"Loaded {len(self.boards):,} positions"
-              f" (policy targets: {'yes' if self.policies is not None else 'no'})")
+        self.total_size = total
+        self.num_chunks = len(self.chunk_paths)
+
+        if lazy:
+            # Lazy mode: load chunks on demand, cache the most recent
+            self._cached_chunk_idx = -1
+            self._cached_boards = None
+            self._cached_values = None
+            self._cached_policies = None
+            print(f"Lazy dataset: {self.total_size:,} positions in {self.num_chunks} chunks "
+                  f"(policy: {'yes' if self.has_policy else 'no'})")
+        else:
+            # Eager mode: load everything into memory
+            print(f"Loading {self.num_chunks} chunks from {data_dir}...")
+            boards, values, policies = [], [], []
+            for path in self.chunk_paths:
+                data = np.load(path)
+                boards.append(data["boards"])
+                values.append(data["values"])
+                if "policies" in data:
+                    policies.append(data["policies"])
+
+            self.boards = np.concatenate(boards, axis=0)
+            self.values = np.concatenate(values, axis=0)
+            self.policies = np.concatenate(policies, axis=0) if policies else None
+            print(f"Loaded {self.total_size:,} positions "
+                  f"(policy: {'yes' if self.policies is not None else 'no'})")
+
+    def _load_chunk(self, chunk_idx: int) -> None:
+        """Load a chunk into cache (lazy mode only)."""
+        if chunk_idx == self._cached_chunk_idx:
+            return
+        data = np.load(self.chunk_paths[chunk_idx])
+        self._cached_boards = data["boards"]
+        self._cached_values = data["values"]
+        self._cached_policies = data["policies"] if "policies" in data else None
+        self._cached_chunk_idx = chunk_idx
+
+    def _find_chunk(self, idx: int) -> tuple[int, int]:
+        """Find which chunk contains global index idx, and the local offset."""
+        for ci, cum in enumerate(self.cumulative_sizes):
+            if idx < cum:
+                local = idx - (self.cumulative_sizes[ci - 1] if ci > 0 else 0)
+                return ci, local
+        raise IndexError(f"Index {idx} out of range")
 
     def __len__(self) -> int:
-        return len(self.boards)
+        return self.total_size
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        board = torch.from_numpy(self.boards[idx])   # [64, 25]
-        value = torch.tensor(self.values[idx])        # scalar
-        policy = torch.tensor(self.policies[idx] if self.policies is not None else 0,
-                              dtype=torch.long)        # move index
+        if self.lazy:
+            ci, local = self._find_chunk(idx)
+            self._load_chunk(ci)
+            board = torch.from_numpy(self._cached_boards[local].copy())
+            value = torch.tensor(self._cached_values[local])
+            pol = self._cached_policies[local] if self._cached_policies is not None else 0
+            policy = torch.tensor(pol, dtype=torch.long)
+        else:
+            board = torch.from_numpy(self.boards[idx])
+            value = torch.tensor(self.values[idx])
+            pol = self.policies[idx] if self.policies is not None else 0
+            policy = torch.tensor(pol, dtype=torch.long)
         return board, value, policy
 
 
@@ -212,6 +265,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lazy", action="store_true", help="Lazy data loading (low RAM)")
     parser.add_argument("--log-dir", default="runs/", help="TensorBoard log dir")
     args = parser.parse_args()
 
@@ -234,7 +288,7 @@ def main():
         model = create_model(args.model_size).to(device)
 
     # Load data
-    dataset = ChessDataset(args.data)
+    dataset = ChessDataset(args.data, lazy=args.lazy)
     train_config = TrainingConfig(
         batch_size=args.batch_size,
         learning_rate=args.lr,
