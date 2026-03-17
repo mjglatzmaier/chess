@@ -15,7 +15,6 @@ Encoding scheme:
 
 import chess
 import numpy as np
-import torch
 
 
 # Piece to plane index mapping
@@ -82,8 +81,9 @@ def fen_to_tensor(fen: str) -> np.ndarray:
     return board_to_tensor(board)
 
 
-def tensor_to_torch(features: np.ndarray) -> torch.Tensor:
+def tensor_to_torch(features: np.ndarray):
     """Convert numpy array to PyTorch tensor."""
+    import torch
     return torch.from_numpy(features)
 
 

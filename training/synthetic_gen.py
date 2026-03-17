@@ -13,13 +13,13 @@ Usage:
 
 import argparse
 import math
+import multiprocessing
 import os
 import random
 import subprocess
 import sys
 import time
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -358,6 +358,9 @@ class StockfishEvaluator:
         self._send(f"setoption name Threads value 1")
         self._send("isready")
         self._wait_for("readyok")
+        self._send("ucinewgame")
+        self._send("isready")
+        self._wait_for("readyok")
 
     def _send(self, cmd: str) -> None:
         self.process.stdin.write(cmd + "\n")
@@ -377,7 +380,6 @@ class StockfishEvaluator:
         Evaluate a position and return centipawns from side-to-move perspective.
         Returns None if evaluation fails. Mate scores converted to ±10000.
         """
-        self._send("ucinewgame")
         self._send(f"position fen {fen}")
         self._send(f"go depth {self.depth}")
 
@@ -431,18 +433,29 @@ def cp_to_value(cp: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _evaluate_worker(
-    fens: list[str],
+    work_queue: "multiprocessing.Queue",
+    result_queue: "multiprocessing.Queue",
     stockfish_path: str,
     depth: int,
-) -> list[tuple[str, float]]:
-    """Worker process: evaluate a batch of FENs with its own Stockfish instance."""
-    results = []
-    with StockfishEvaluator(stockfish_path, depth=depth) as sf:
-        for fen in fens:
-            cp = sf.evaluate(fen)
-            if cp is not None:
-                results.append((fen, cp_to_value(cp)))
-    return results
+    hash_mb: int,
+) -> None:
+    """
+    Persistent worker process: pulls FEN batches from work_queue, evaluates
+    with a single long-lived Stockfish instance, pushes results to result_queue.
+    Sentinel value None signals shutdown.
+    """
+    with StockfishEvaluator(stockfish_path, depth=depth, hash_mb=hash_mb) as sf:
+        while True:
+            item = work_queue.get()
+            if item is None:
+                break
+            batch_id, fens = item
+            results = []
+            for fen in fens:
+                cp = sf.evaluate(fen)
+                if cp is not None:
+                    results.append((fen, cp_to_value(cp)))
+            result_queue.put((batch_id, results))
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +466,9 @@ class SyntheticGenerator:
     """
     Generates synthetic chess positions with controlled material and
     Stockfish evaluations. Outputs training data in .npz chunk format.
+
+    Uses persistent worker processes, each with a long-lived Stockfish
+    instance, to avoid per-config process spawn and SF startup overhead.
     """
 
     def __init__(
@@ -461,11 +477,70 @@ class SyntheticGenerator:
         depth: int = 20,
         threads: int = 4,
         chunk_size: int = 100_000,
+        hash_mb: int = 64,
     ):
         self.stockfish_path = stockfish_path
         self.depth = depth
         self.threads = threads
         self.chunk_size = chunk_size
+        self.hash_mb = hash_mb
+
+    def _evaluate_fens(self, fens: list[str]) -> list[tuple[str, float]]:
+        """
+        Evaluate a list of FENs using persistent worker pool.
+        Splits work into small batches across N Stockfish processes.
+        """
+        if not fens:
+            return []
+
+        if self.threads <= 1:
+            # Single-threaded: direct evaluation, no IPC overhead
+            results = []
+            with StockfishEvaluator(self.stockfish_path, depth=self.depth,
+                                     hash_mb=self.hash_mb) as sf:
+                for fen in fens:
+                    cp = sf.evaluate(fen)
+                    if cp is not None:
+                        results.append((fen, cp_to_value(cp)))
+            return results
+
+        # Multi-threaded: persistent workers with queues
+        ctx = multiprocessing.get_context("spawn")
+        work_queue: multiprocessing.Queue = ctx.Queue()
+        result_queue: multiprocessing.Queue = ctx.Queue()
+
+        # Start persistent workers
+        workers = []
+        for _ in range(self.threads):
+            p = ctx.Process(
+                target=_evaluate_worker,
+                args=(work_queue, result_queue, self.stockfish_path,
+                      self.depth, self.hash_mb),
+            )
+            p.start()
+            workers.append(p)
+
+        # Split FENs into small batches (~50 per batch for good load balancing)
+        batch_size = max(1, min(50, len(fens) // (self.threads * 2)))
+        batches = [fens[i:i + batch_size] for i in range(0, len(fens), batch_size)]
+        for i, batch in enumerate(batches):
+            work_queue.put((i, batch))
+
+        # Collect results
+        results: list[tuple[str, float]] = []
+        for _ in range(len(batches)):
+            batch_id, batch_results = result_queue.get()
+            results.extend(batch_results)
+
+        # Shutdown workers
+        for _ in workers:
+            work_queue.put(None)
+        for p in workers:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+
+        return results
 
     def generate_material_config(
         self,
@@ -476,7 +551,6 @@ class SyntheticGenerator:
         Generate random positions with specific material and evaluate with SF.
         Returns list of (FEN, value) pairs where value is in [-1, +1].
         """
-        # Generate positions (fast, no Stockfish needed)
         positions = generate_positions_for_config(config)
         fens = [fen for fen, _ in positions]
 
@@ -484,34 +558,56 @@ class SyntheticGenerator:
             print(f"  Warning: Could not generate positions for {config.name}")
             return []
 
-        # Split FENs across worker processes for parallel evaluation
-        results: list[tuple[str, float]] = []
-        batch_size = max(1, len(fens) // self.threads)
-        batches = [fens[i:i + batch_size] for i in range(0, len(fens), batch_size)]
-
-        desc = f"  {config.name}" if progress else None
-        pbar = tqdm(total=len(fens), desc=desc, disable=not progress)
-
-        if self.threads <= 1:
-            # Single-threaded evaluation
-            worker_results = _evaluate_worker(fens, self.stockfish_path, self.depth)
-            results.extend(worker_results)
-            pbar.update(len(fens))
-        else:
-            with ProcessPoolExecutor(max_workers=self.threads) as executor:
-                futures = {
-                    executor.submit(
-                        _evaluate_worker, batch, self.stockfish_path, self.depth
-                    ): len(batch)
-                    for batch in batches
-                }
-                for future in as_completed(futures):
-                    batch_results = future.result()
-                    results.extend(batch_results)
-                    pbar.update(futures[future])
-
-        pbar.close()
+        results = self._evaluate_fens(fens)
         return results
+
+    def _load_checkpoint(self, output_dir: str) -> tuple[set[str], dict[str, int], int, int]:
+        """Load generation checkpoint if it exists. Returns (done_configs, stats, chunk_idx, total)."""
+        ckpt_path = os.path.join(output_dir, "_checkpoint.json")
+        if os.path.exists(ckpt_path):
+            import json
+            with open(ckpt_path) as f:
+                ckpt = json.load(f)
+            done = set(ckpt.get("completed_configs", []))
+            stats = ckpt.get("stats", {})
+            chunk_idx = ckpt.get("next_chunk_idx", 0)
+            total = ckpt.get("total_positions", 0)
+            print(f"Resuming from checkpoint: {len(done)} configs done, "
+                  f"{total:,} positions in {chunk_idx} chunks")
+            return done, stats, chunk_idx, total
+        return set(), {}, 0, 0
+
+    def _save_checkpoint(
+        self, output_dir: str, done: set[str], stats: dict, chunk_idx: int, total: int,
+    ) -> None:
+        """Save generation checkpoint for resume support."""
+        import json
+        ckpt = {
+            "completed_configs": sorted(done),
+            "stats": stats,
+            "next_chunk_idx": chunk_idx,
+            "total_positions": total,
+            "depth": self.depth,
+        }
+        ckpt_path = os.path.join(output_dir, "_checkpoint.json")
+        with open(ckpt_path, "w") as f:
+            json.dump(ckpt, f, indent=2)
+
+    def _save_metadata(self, output_dir: str, chunk_idx: int, total: int) -> None:
+        """Write/update metadata.npz so partial results are already loadable."""
+        metadata = {
+            "total_positions": total,
+            "total_games": 0,
+            "skipped_games": 0,
+            "num_chunks": chunk_idx,
+            "chunk_size": self.chunk_size,
+            "num_features": NUM_FEATURES,
+            "skip_moves": 0,
+            "source": "synthetic",
+            "has_policy": True,
+            "stockfish_depth": self.depth,
+        }
+        np.savez(os.path.join(output_dir, "metadata.npz"), **metadata)
 
     def generate_all(
         self,
@@ -519,7 +615,11 @@ class SyntheticGenerator:
         configs: Optional[list[MaterialConfig]] = None,
     ) -> dict:
         """
-        Generate the full synthetic dataset.
+        Generate the full synthetic dataset with per-config checkpointing.
+
+        Uses a single persistent worker pool across all configs to minimize
+        Stockfish startup overhead. Saves a chunk and checkpoint after each
+        config so generation can be interrupted and resumed.
 
         Args:
             output_dir: Directory to write .npz chunks
@@ -532,88 +632,147 @@ class SyntheticGenerator:
             configs = DEFAULT_CONFIGS
 
         os.makedirs(output_dir, exist_ok=True)
+        source_id = 1
 
-        all_fens: list[str] = []
-        all_values: list[float] = []
-        stats: dict[str, int] = {}
-        source_id = 1  # synthetic source identifier
+        # Load checkpoint for resume
+        done_configs, stats, chunk_idx, total_positions = self._load_checkpoint(output_dir)
 
+        remaining = [c for c in configs if c.name not in done_configs]
         print(f"Generating synthetic positions (depth={self.depth}, threads={self.threads})")
-        print(f"  Configs: {len(configs)}, target positions: "
-              f"{sum(c.num_positions for c in configs):,}")
+        print(f"  Total configs: {len(configs)}, remaining: {len(remaining)}, "
+              f"target positions: {sum(c.num_positions for c in remaining):,}")
         print()
 
-        for config in configs:
-            results = self.generate_material_config(config)
-            stats[config.name] = len(results)
-            for fen, value in results:
-                all_fens.append(fen)
-                all_values.append(value)
+        if not remaining:
+            print("All configs already completed.")
+            return stats
 
-        # Shuffle all positions together
-        combined = list(zip(all_fens, all_values))
-        random.shuffle(combined)
-        all_fens, all_values = zip(*combined) if combined else ([], [])
+        boards_buf: list = []
+        values_buf: list = []
+        policy_buf: list = []
+        sources_buf: list = []
+        weights_buf: list = []
 
-        # Encode and save as chunks
-        total_positions = len(all_fens)
-        chunk_idx = 0
-        boards_buf = []
-        values_buf = []
-        policy_buf = []
-        sources_buf = []
-        weights_buf = []
-
-        print(f"\nEncoding {total_positions:,} positions into chunks...")
-        for fen, value in tqdm(zip(all_fens, all_values), total=total_positions):
-            board = chess.Board(fen)
-            features = board_to_tensor(board)
-
-            # Pick a random legal move as policy target
-            legal_moves = list(board.legal_moves)
-            if legal_moves:
-                move = random.choice(legal_moves)
-                policy_idx = move_to_index(move)
-            else:
-                policy_idx = 0
-
-            boards_buf.append(features)
-            values_buf.append(value)
-            policy_buf.append(policy_idx)
-            sources_buf.append(source_id)
-            weights_buf.append(1.0)
-
-            if len(boards_buf) >= self.chunk_size:
-                _save_synthetic_chunk(
-                    output_dir, chunk_idx,
-                    boards_buf, values_buf, policy_buf, sources_buf, weights_buf,
+        # Start persistent worker pool ONCE for all configs
+        if self.threads > 1:
+            ctx = multiprocessing.get_context("spawn")
+            work_queue: multiprocessing.Queue = ctx.Queue()
+            result_queue: multiprocessing.Queue = ctx.Queue()
+            workers = []
+            for _ in range(self.threads):
+                p = ctx.Process(
+                    target=_evaluate_worker,
+                    args=(work_queue, result_queue, self.stockfish_path,
+                          self.depth, self.hash_mb),
                 )
-                chunk_idx += 1
-                boards_buf, values_buf, policy_buf = [], [], []
-                sources_buf, weights_buf = [], []
-
-        # Final partial chunk
-        if boards_buf:
-            _save_synthetic_chunk(
-                output_dir, chunk_idx,
-                boards_buf, values_buf, policy_buf, sources_buf, weights_buf,
+                p.start()
+                workers.append(p)
+        else:
+            # Single-thread: use direct evaluator
+            sf_single = StockfishEvaluator(
+                self.stockfish_path, depth=self.depth, hash_mb=self.hash_mb,
             )
-            chunk_idx += 1
 
-        # Save metadata
-        metadata = {
-            "total_positions": total_positions,
-            "total_games": 0,
-            "skipped_games": 0,
-            "num_chunks": chunk_idx,
-            "chunk_size": self.chunk_size,
-            "num_features": NUM_FEATURES,
-            "skip_moves": 0,
-            "source": "synthetic",
-            "has_policy": True,
-            "stockfish_depth": self.depth,
-        }
-        np.savez(os.path.join(output_dir, "metadata.npz"), **metadata)
+        try:
+            for ci, config in enumerate(remaining):
+                # Generate positions (fast, CPU-only)
+                positions = generate_positions_for_config(config)
+                fens = [fen for fen, _ in positions]
+
+                if not fens:
+                    print(f"  Warning: Could not generate positions for {config.name}")
+                    done_configs.add(config.name)
+                    stats[config.name] = 0
+                    continue
+
+                # Evaluate with Stockfish
+                if self.threads > 1:
+                    batch_size = max(1, min(50, len(fens) // (self.threads * 2)))
+                    batches = [fens[i:i + batch_size]
+                               for i in range(0, len(fens), batch_size)]
+                    for i, batch in enumerate(batches):
+                        work_queue.put((i, batch))
+
+                    results: list[tuple[str, float]] = []
+                    for _ in range(len(batches)):
+                        _, batch_results = result_queue.get()
+                        results.extend(batch_results)
+                else:
+                    results = []
+                    for fen in fens:
+                        cp = sf_single.evaluate(fen)
+                        if cp is not None:
+                            results.append((fen, cp_to_value(cp)))
+
+                stats[config.name] = len(results)
+
+                # Encode positions into buffer
+                for fen, value in results:
+                    board = chess.Board(fen)
+                    features = board_to_tensor(board)
+                    legal_moves = list(board.legal_moves)
+                    if legal_moves:
+                        move = random.choice(legal_moves)
+                        policy_idx = move_to_index(move)
+                    else:
+                        policy_idx = 0
+
+                    boards_buf.append(features)
+                    values_buf.append(value)
+                    policy_buf.append(policy_idx)
+                    sources_buf.append(source_id)
+                    weights_buf.append(1.0)
+
+                total_positions += len(results)
+                done_configs.add(config.name)
+
+                # Flush buffer to chunk when it's large enough
+                while len(boards_buf) >= self.chunk_size:
+                    _save_synthetic_chunk(
+                        output_dir, chunk_idx,
+                        boards_buf[:self.chunk_size],
+                        values_buf[:self.chunk_size],
+                        policy_buf[:self.chunk_size],
+                        sources_buf[:self.chunk_size],
+                        weights_buf[:self.chunk_size],
+                    )
+                    boards_buf = boards_buf[self.chunk_size:]
+                    values_buf = values_buf[self.chunk_size:]
+                    policy_buf = policy_buf[self.chunk_size:]
+                    sources_buf = sources_buf[self.chunk_size:]
+                    weights_buf = weights_buf[self.chunk_size:]
+                    chunk_idx += 1
+
+                # Checkpoint: flush remaining buffer so all evaluated data is on disk
+                if boards_buf:
+                    _save_synthetic_chunk(
+                        output_dir, chunk_idx,
+                        boards_buf, values_buf, policy_buf, sources_buf, weights_buf,
+                    )
+                    chunk_idx += 1
+                    boards_buf, values_buf, policy_buf = [], [], []
+                    sources_buf, weights_buf = [], []
+
+                self._save_metadata(output_dir, chunk_idx, total_positions)
+                self._save_checkpoint(output_dir, done_configs, stats,
+                                      chunk_idx, total_positions)
+
+                done_count = len(done_configs)
+                total_count = len(configs)
+                print(f"  [{done_count}/{total_count}] {config.name}: "
+                      f"{len(results)} positions (total: {total_positions:,})")
+
+        finally:
+            # Clean up worker pool
+            if self.threads > 1:
+                for _ in workers:
+                    work_queue.put(None)
+                for p in workers:
+                    p.join(timeout=10)
+                    if p.is_alive():
+                        p.kill()
+            else:
+                sf_single.close()
 
         # Print summary
         print(f"\nDone: {total_positions:,} positions in {chunk_idx} chunks")
@@ -698,6 +857,10 @@ def main():
         help="Positions per chunk (default: 100000)",
     )
     parser.add_argument(
+        "--hash", type=int, default=64,
+        help="Stockfish hash table size in MB per instance (default: 64)",
+    )
+    parser.add_argument(
         "--list-configs", action="store_true",
         help="Print all configs and exit (no generation)",
     )
@@ -766,6 +929,7 @@ def main():
         depth=args.depth,
         threads=args.threads,
         chunk_size=args.chunk_size,
+        hash_mb=args.hash,
     )
     generator.generate_all(args.output, configs)
 
