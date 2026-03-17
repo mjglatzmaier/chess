@@ -70,7 +70,8 @@ class MixedChessDataset(Dataset):
         # Build unified index: list of (source_name, chunk_path, chunk_offset, chunk_size)
         self.entries: list[tuple[str, str, int, int]] = []  # per-chunk entries
         self.chunk_cumulative: list[int] = []
-        self.source_indices: dict[str, list[int]] = {n: [] for n in self.source_names}
+        # Store source ranges as (start, end) for memory-efficient sampling
+        self.source_ranges: dict[str, list[tuple[int, int]]] = {n: [] for n in self.source_names}
         total = 0
 
         for name in self.source_names:
@@ -87,11 +88,13 @@ class MixedChessDataset(Dataset):
                 self.entries.append((name, str(cpath), start_idx, sz))
                 total += sz
                 self.chunk_cumulative.append(total)
-                # Record which global indices belong to this source
-                for i in range(start_idx, total):
-                    self.source_indices[name].append(i)
+                self.source_ranges[name].append((start_idx, total))
 
         self.total_size = total
+        self._source_sizes: dict[str, int] = {
+            name: sum(end - start for start, end in ranges)
+            for name, ranges in self.source_ranges.items()
+        }
 
         # LRU chunk cache
         self._chunk_cache: OrderedDict[str, tuple] = OrderedDict()
@@ -99,7 +102,7 @@ class MixedChessDataset(Dataset):
         # Print summary
         print(f"MixedChessDataset: {self.total_size:,} total positions")
         for name in self.source_names:
-            count = len(self.source_indices[name])
+            count = self._source_sizes.get(name, 0)
             ratio = self.source_ratios.get(name, 0)
             print(f"  {name}: {count:,} positions (target ratio: {ratio:.1%})")
 
@@ -174,16 +177,17 @@ class ProportionalSampler(Sampler):
 
         indices = []
         for name, ratio in self.dataset.source_ratios.items():
-            source_indices = self.dataset.source_indices[name]
-            if not source_indices:
+            ranges = self.dataset.source_ranges[name]
+            source_size = self.dataset._source_sizes.get(name, 0)
+            if not ranges or source_size == 0:
                 continue
-            # Number of samples from this source for this epoch
             n_samples = int(self.epoch_size * ratio)
-            # Sample with replacement if source is smaller than needed
-            if n_samples <= len(source_indices):
-                sampled = rng.sample(source_indices, n_samples)
-            else:
-                sampled = rng.choices(source_indices, k=n_samples)
+            # Sample indices from ranges
+            sampled = []
+            for _ in range(n_samples):
+                # Pick a random range weighted by size, then a random index within it
+                start, end = rng.choice(ranges)
+                sampled.append(rng.randint(start, end - 1))
             indices.extend(sampled)
 
         rng.shuffle(indices)

@@ -230,7 +230,7 @@ class TestLazyLoading:
         """Create a small test dataset with 3 chunks."""
         for i in range(3):
             n = 100
-            boards = np.random.randn(n, 64, 25).astype(np.float32)
+            boards = np.random.randn(n, 65, 27).astype(np.float32)
             values = np.random.uniform(-1, 1, n).astype(np.float32)
             policies = np.random.randint(0, 4096, n).astype(np.int64)
             np.savez_compressed(
@@ -241,7 +241,7 @@ class TestLazyLoading:
             tmp_path / "metadata.npz",
             num_chunks=3, has_policy=True,
             total_positions=300, chunk_size=100,
-            num_features=25, skip_moves=0,
+            num_features=27, skip_moves=0,
             source="test",
         )
         return str(tmp_path)
@@ -250,13 +250,13 @@ class TestLazyLoading:
         ds = ChessDataset(sample_data_dir, lazy=False)
         assert len(ds) == 300
         board, value, policy = ds[0]
-        assert board.shape == (64, 25)
+        assert board.shape == (65, 27)
 
     def test_lazy_loading(self, sample_data_dir):
         ds = ChessDataset(sample_data_dir, lazy=True, chunk_cache_size=2)
         assert len(ds) == 300
         board, value, policy = ds[0]
-        assert board.shape == (64, 25)
+        assert board.shape == (65, 27)
 
     def test_lazy_cross_chunk_access(self, sample_data_dir):
         ds = ChessDataset(sample_data_dir, lazy=True, chunk_cache_size=2)
@@ -264,9 +264,9 @@ class TestLazyLoading:
         b0, _, _ = ds[0]    # chunk 0
         b1, _, _ = ds[100]  # chunk 1
         b2, _, _ = ds[200]  # chunk 2
-        assert b0.shape == (64, 25)
-        assert b1.shape == (64, 25)
-        assert b2.shape == (64, 25)
+        assert b0.shape == (65, 27)
+        assert b1.shape == (65, 27)
+        assert b2.shape == (65, 27)
 
     def test_lazy_lru_eviction(self, sample_data_dir):
         ds = ChessDataset(sample_data_dir, lazy=True, chunk_cache_size=2)
@@ -305,7 +305,7 @@ def _create_source(tmp_path, name, n_chunks, chunk_size, source_id=0):
     src_dir.mkdir()
     total = 0
     for i in range(n_chunks):
-        boards = np.random.randn(chunk_size, 64, 25).astype(np.float32)
+        boards = np.random.randn(chunk_size, 65, 27).astype(np.float32)
         values = np.random.uniform(-1, 1, chunk_size).astype(np.float32)
         policies = np.random.randint(0, 4096, chunk_size).astype(np.int64)
         sources = np.full(chunk_size, source_id, dtype=np.uint8)
@@ -320,7 +320,7 @@ def _create_source(tmp_path, name, n_chunks, chunk_size, source_id=0):
         src_dir / "metadata.npz",
         num_chunks=n_chunks, has_policy=True,
         total_positions=total, chunk_size=chunk_size,
-        num_features=25, skip_moves=0, source=name,
+        num_features=27, skip_moves=0, source=name,
     )
     return str(src_dir)
 
@@ -346,7 +346,7 @@ class TestDataMixer:
         src_a, src_b = two_sources
         ds = MixedChessDataset({"a": (src_a, 0.5), "b": (src_b, 0.5)})
         board, value, policy = ds[0]
-        assert board.shape == (64, 25)
+        assert board.shape == (65, 27)
         assert isinstance(value, torch.Tensor)
         assert isinstance(policy, torch.Tensor)
 
@@ -372,7 +372,7 @@ class TestDataMixer:
         loader = mixer.get_dataloader(batch_size=16, num_workers=0, epoch_size=100)
         batch = next(iter(loader))
         boards, values, policies = batch
-        assert boards.shape == (16, 64, 25)
+        assert boards.shape == (16, 65, 27)
         assert values.shape == (16,)
         assert policies.shape == (16,)
 
@@ -487,12 +487,12 @@ class TestSyntheticGeneratorIntegration:
             os.path.join(output_dir, "metadata.npz"),
             num_chunks=1, has_policy=True,
             total_positions=len(positions), chunk_size=100000,
-            num_features=25, skip_moves=0, source="synthetic",
+            num_features=27, skip_moves=0, source="synthetic",
         )
 
         # Verify it loads correctly with ChessDataset
         ds = ChessDataset(output_dir, lazy=True)
         assert len(ds) == 10
         board, value, policy = ds[0]
-        assert board.shape == (64, 25)
+        assert board.shape == (65, 27)
         assert -1.0 <= value.item() <= 1.0

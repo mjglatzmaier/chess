@@ -33,13 +33,17 @@ SOURCE_NAMES = {0: "ccrl", 1: "synthetic", 2: "endgame", 3: "opening"}
 
 def count_material(board_tensor: np.ndarray) -> str:
     """
-    Extract material signature from a [64, 25] board tensor.
+    Extract material signature from a board tensor.
+    Works with both [64, 25] (old) and [65, 27] (new) format.
     Returns string like 'KQR vs KRR'.
     """
     white_pieces = []
     black_pieces = []
 
-    for sq in range(64):
+    # Only look at first 64 rows (square tokens)
+    num_squares = min(64, board_tensor.shape[0])
+
+    for sq in range(num_squares):
         for plane in range(12):
             if board_tensor[sq, plane] > 0.5:
                 piece_char = PIECE_PLANES[plane]
@@ -63,8 +67,9 @@ def estimate_phase(board_tensor: np.ndarray) -> str:
     """
     # Count major/minor pieces (planes 1-4 white, 7-10 black)
     minor_major_planes = [1, 2, 3, 4, 7, 8, 9, 10]
+    num_squares = min(64, board_tensor.shape[0])
     piece_count = 0
-    for sq in range(64):
+    for sq in range(num_squares):
         for plane in minor_major_planes:
             if board_tensor[sq, plane] > 0.5:
                 piece_count += 1

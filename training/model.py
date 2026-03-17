@@ -2,11 +2,11 @@
 Chess Transformer — neural network architecture for board evaluation.
 
 Architecture:
-    Input:    [batch, 64, 25] — 64 square tokens, 25 features each
-    Embed:    Linear(25, embed_dim) + learned positional encoding
+    Input:    [batch, 65, 27] — 64 square tokens + 1 global context token
+    Embed:    Linear(27, embed_dim) + learned positional encoding (65 positions)
     Encoder:  N × TransformerEncoderLayer (self-attention + FFN)
-    Value:    mean-pool → Linear(embed_dim, 1) → tanh
-    Policy:   per-token → Linear(embed_dim, 64) → reshape to [64, 64]
+    Value:    global_token + mean_pool → 3-layer MLP → tanh
+    Policy:   per-square-token → Linear(embed_dim, 64) → reshape to [64, 64]
 
 The value head predicts game outcome: +1 white wins, -1 black wins.
 The policy head predicts move probabilities as a 64×64 from-to matrix.
@@ -15,8 +15,10 @@ Design rationale:
     - Self-attention lets every square attend to every other square in one layer,
       enabling the model to learn long-range relationships (pins, skewers, batteries)
       that CNNs need many layers to capture.
-    - Mean pooling (not CLS token) gives a position-aware aggregate that considers
-      all squares equally — important since chess has no "most important" square.
+    - A dedicated global context token (index 64) carries side-to-move, castling,
+      en passant, and halfmove clock — avoiding redundant broadcasting to all squares.
+    - The value head combines the global token with mean-pooled square tokens,
+      giving it both board-level context and piece-level detail.
     - Separate value/policy heads share the encoder backbone, which is efficient
       and forces the encoder to learn features useful for both evaluation and
       move selection.
@@ -66,8 +68,10 @@ class ChessTransformer(nn.Module):
         # Layer norm before heads
         self.output_norm = nn.LayerNorm(config.embed_dim)
 
-        # Value head: scalar evaluation
+        # Value head: scalar evaluation (3-layer MLP)
         self.value_head = nn.Sequential(
+            nn.Linear(config.embed_dim, config.embed_dim),
+            nn.GELU(),
             nn.Linear(config.embed_dim, config.embed_dim // 2),
             nn.GELU(),
             nn.Linear(config.embed_dim // 2, 1),
@@ -83,15 +87,19 @@ class ChessTransformer(nn.Module):
 
     def _init_weights(self):
         """Initialize weights with small values for stable training."""
-        for name, param in self.named_parameters():
-            if "weight" in name and param.dim() >= 2:
-                nn.init.xavier_uniform_(param, gain=0.1)
-            elif "bias" in name:
-                nn.init.zeros_(param)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
-        # Zero-init the value head output layer for stable start
-        nn.init.zeros_(self.value_head[-2].weight)
-        nn.init.zeros_(self.value_head[-2].bias)
+        # Zero-init the value head output layer for stable start (predict 0 = draw)
+        output_linear = self.value_head[-2]  # Linear before Tanh
+        nn.init.zeros_(output_linear.weight)
+        nn.init.zeros_(output_linear.bias)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -124,20 +132,23 @@ class ChessTransformer(nn.Module):
         Full forward pass: encode → value + policy.
 
         Args:
-            x: [batch, 64, 25] input features
+            x: [batch, 65, 27] input features (64 squares + 1 global token)
 
         Returns:
             value:  [batch, 1] — game outcome prediction in [-1, +1]
             policy: [batch, 4096] — move logits (from_sq * 64 + to_sq)
         """
-        encoded = self.encode(x)  # [batch, 64, embed_dim]
+        encoded = self.encode(x)  # [batch, 65, embed_dim]
 
-        # Value head: mean pool over all squares, then predict scalar
-        pooled = encoded.mean(dim=1)  # [batch, embed_dim]
-        value = self.value_head(pooled)  # [batch, 1]
+        # Value head: use global token (index 64) + mean of square tokens
+        global_token = encoded[:, 64, :]            # [batch, embed_dim]
+        square_mean = encoded[:, :64, :].mean(dim=1) # [batch, embed_dim]
+        pooled = global_token + square_mean           # [batch, embed_dim]
+        value = self.value_head(pooled)               # [batch, 1]
 
-        # Policy head: each square produces 64 target-square logits
-        policy_per_square = self.policy_head(encoded)  # [batch, 64, 64]
+        # Policy head: only the 64 square tokens produce move logits
+        square_tokens = encoded[:, :64, :]            # [batch, 64, embed_dim]
+        policy_per_square = self.policy_head(square_tokens)  # [batch, 64, 64]
         policy = policy_per_square.reshape(-1, 4096)  # [batch, 4096]
 
         return value, policy
@@ -147,13 +158,15 @@ class ChessTransformer(nn.Module):
         Value-only forward pass (faster, no policy computation).
 
         Args:
-            x: [batch, 64, 25] input features
+            x: [batch, 65, 27] input features
 
         Returns:
             [batch, 1] — game outcome prediction in [-1, +1]
         """
         encoded = self.encode(x)
-        pooled = encoded.mean(dim=1)
+        global_token = encoded[:, 64, :]
+        square_mean = encoded[:, :64, :].mean(dim=1)
+        pooled = global_token + square_mean
         return self.value_head(pooled)
 
     def count_parameters(self) -> int:
@@ -178,7 +191,7 @@ if __name__ == "__main__":
     # Quick test: create each model size and run a forward pass
     for size in ["tiny", "small", "medium"]:
         model = create_model(size)
-        dummy_input = torch.randn(2, 64, 25)
+        dummy_input = torch.randn(2, 65, 27)
         value, policy = model(dummy_input)
         print(f"  value shape: {value.shape}, policy shape: {policy.shape}")
         print(f"  value range: [{value.min():.3f}, {value.max():.3f}]")

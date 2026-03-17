@@ -1,16 +1,22 @@
 """
 Board encoding: convert chess positions to/from tensor representations.
 
-Encoding scheme:
-  Per square (64 squares total), we encode:
+Encoding scheme (v2 — global context token):
+  64 square tokens, each with 13 features:
     - Piece presence: 12 planes (P,N,B,R,Q,K for white, p,n,b,r,q,k for black)
-    - Side to move: 1 plane (all 1s if white to move, all 0s if black)
-    - Castling rights: 4 planes (KQkq, each all 1s or all 0s)
-    - En passant: 8 planes (one per file, all 0s if no ep)
-  Total: 25 binary features per square → [64, 25] tensor
+    - Empty square indicator: 1 plane
 
-  This flat-per-square encoding is natural for transformer input where
-  each square becomes a token in the sequence.
+  1 global context token (index 64) with 14 features:
+    - Side to move: 1 plane
+    - Castling rights: 4 planes (KQkq)
+    - En passant file: 8 planes (one per file)
+    - Halfmove clock: 1 plane (normalized to [0, 1])
+
+  Total: 65 tokens × 27 features (zero-padded to uniform width).
+
+  The global token approach avoids broadcasting side-to-move and castling
+  to all 64 squares, letting the model learn the difference between
+  per-square and global information through attention.
 """
 
 import chess
@@ -33,44 +39,53 @@ PIECE_TO_PLANE = {
     (chess.KING, chess.BLACK): 11,
 }
 
-NUM_FEATURES = 25  # 12 piece + 1 stm + 4 castling + 8 ep
+NUM_FEATURES = 13  # 12 piece planes + 1 empty indicator (per-square only)
+NUM_GLOBAL_FEATURES = 14  # 1 stm + 4 castling + 8 ep + 1 halfmove clock
 
 
 def board_to_tensor(board: chess.Board) -> np.ndarray:
     """
-    Encode a chess board as a [64, 25] float32 array.
+    Encode a chess board as a [65, 27] float32 array.
 
-    Each of the 64 squares gets a 25-dimensional feature vector:
+    64 square tokens with per-square features:
       [0:12]  - piece presence (one-hot over 12 piece types)
-      [12]    - side to move (1 if white, 0 if black)
-      [13:17] - castling rights (K, Q, k, q)
-      [17:25] - en passant file (one-hot, 8 files)
+      [12]    - empty square indicator (1 if no piece, 0 if occupied)
 
-    Square ordering: a1=0, b1=1, ..., h8=63 (same as python-chess).
+    1 global context token (index 64) with board-level features:
+      [13]    - side to move (1 if white, 0 if black)
+      [14:18] - castling rights (K, Q, k, q)
+      [18:26] - en passant file (one-hot, 8 files)
+      [26]    - halfmove clock (normalized: clock / 100, clamped to [0, 1])
+
+    Total features per token: 27 (13 per-square + 14 global, zero-padded).
+    Square ordering: a1=0, b1=1, ..., h8=63, global=64.
     """
-    features = np.zeros((64, NUM_FEATURES), dtype=np.float32)
+    num_features = NUM_FEATURES + NUM_GLOBAL_FEATURES
+    features = np.zeros((65, num_features), dtype=np.float32)
 
-    # Piece planes (0-11)
+    # Piece planes (0-11) for square tokens
     for sq in range(64):
         piece = board.piece_at(sq)
         if piece is not None:
             plane = PIECE_TO_PLANE[(piece.piece_type, piece.color)]
             features[sq, plane] = 1.0
+        else:
+            features[sq, 12] = 1.0  # empty square indicator
 
-    # Side to move (12) — broadcast to all squares
-    stm = 1.0 if board.turn == chess.WHITE else 0.0
-    features[:, 12] = stm
+    # Global context token (index 64)
+    g = 64
+    features[g, 13] = 1.0 if board.turn == chess.WHITE else 0.0
+    features[g, 14] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    features[g, 15] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    features[g, 16] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    features[g, 17] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
 
-    # Castling rights (13-16) — broadcast to all squares
-    features[:, 13] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    features[:, 14] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    features[:, 15] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    features[:, 16] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
-
-    # En passant (17-24) — broadcast ep file to all squares
     if board.has_legal_en_passant():
         ep_file = chess.square_file(board.ep_square)
-        features[:, 17 + ep_file] = 1.0
+        features[g, 18 + ep_file] = 1.0
+
+    # Halfmove clock (normalized to [0, 1])
+    features[g, 26] = min(board.halfmove_clock / 100.0, 1.0)
 
     return features
 

@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import time
 from collections import OrderedDict
@@ -154,8 +155,9 @@ def train(
     output_path: str,
     device: torch.device,
     log_dir: str | None = None,
+    val_loader: DataLoader | None = None,
 ) -> None:
-    """Main training loop."""
+    """Main training loop with warmup, validation, and per-loss tracking."""
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -163,11 +165,16 @@ def train(
         weight_decay=config.weight_decay,
     )
 
-    # Cosine annealing LR schedule
+    # Linear warmup then cosine decay
     total_steps = len(train_loader) * config.epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=config.learning_rate * 0.01
-    )
+
+    def lr_lambda(step: int) -> float:
+        if step < config.warmup_steps:
+            return step / max(1, config.warmup_steps)
+        progress = (step - config.warmup_steps) / max(1, total_steps - config.warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Mixed precision scaler
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -177,39 +184,34 @@ def train(
 
     model.train()
     global_step = 0
-    best_loss = float("inf")
+    best_val_loss = float("inf")
 
     for epoch in range(config.epochs):
         epoch_loss = 0.0
         epoch_value_loss = 0.0
+        epoch_policy_loss = 0.0
         epoch_samples = 0
         t0 = time.time()
 
         for batch_idx, (boards, values, policies) in enumerate(train_loader):
-            boards = boards.to(device)        # [batch, 64, 25]
-            values = values.to(device)        # [batch]
-            policies = policies.to(device)    # [batch] move indices
+            boards = boards.to(device)
+            values = values.to(device)
+            policies = policies.to(device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 pred_value, pred_policy = model(boards)
-                pred_value = pred_value.squeeze(-1)  # [batch]
+                pred_value = pred_value.squeeze(-1)
 
-                # Value loss: MSE between predicted and target outcome
                 value_loss = F.mse_loss(pred_value, values)
-
-                # Policy loss: cross-entropy with the move actually played
-                # This is next-move prediction — like next-token in LLMs
                 policy_loss = F.cross_entropy(pred_policy, policies)
 
-                # Combined loss
                 loss = (config.value_loss_weight * value_loss +
                         config.policy_loss_weight * policy_loss)
 
             scaler.scale(loss).backward()
 
-            # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
 
@@ -217,10 +219,11 @@ def train(
             scaler.update()
             scheduler.step()
 
-            epoch_loss += loss.item() * boards.size(0)
-            epoch_value_loss += value_loss.item() * boards.size(0)
-            epoch_policy_loss = getattr(locals().get('epoch_policy_loss', 0), '__add__', lambda x: x)(0)
-            epoch_samples += boards.size(0)
+            batch_size = boards.size(0)
+            epoch_loss += loss.item() * batch_size
+            epoch_value_loss += value_loss.item() * batch_size
+            epoch_policy_loss += policy_loss.item() * batch_size
+            epoch_samples += batch_size
             global_step += 1
 
             if writer and global_step % 100 == 0:
@@ -232,21 +235,32 @@ def train(
         # Epoch summary
         avg_loss = epoch_loss / epoch_samples
         avg_value_loss = epoch_value_loss / epoch_samples
+        avg_policy_loss = epoch_policy_loss / epoch_samples
         elapsed = time.time() - t0
         samples_per_sec = epoch_samples / elapsed
 
         print(
             f"Epoch {epoch + 1}/{config.epochs} | "
             f"loss: {avg_loss:.6f} | "
-            f"value_loss: {avg_value_loss:.6f} | "
+            f"value: {avg_value_loss:.6f} | "
+            f"policy: {avg_policy_loss:.4f} | "
             f"lr: {scheduler.get_last_lr()[0]:.2e} | "
-            f"{samples_per_sec:.0f} samples/sec | "
+            f"{samples_per_sec:.0f} pos/s | "
             f"{elapsed:.1f}s"
         )
 
         if writer:
             writer.add_scalar("epoch/loss", avg_loss, epoch)
             writer.add_scalar("epoch/value_loss", avg_value_loss, epoch)
+            writer.add_scalar("epoch/policy_loss", avg_policy_loss, epoch)
+
+        # Validation
+        val_loss = None
+        if val_loader is not None and (epoch + 1) % config.eval_every == 0:
+            val_loss = _evaluate(model, val_loader, config, device)
+            print(f"  val_loss: {val_loss:.6f}")
+            if writer:
+                writer.add_scalar("epoch/val_loss", val_loss, epoch)
 
         # Save checkpoint
         if (epoch + 1) % config.save_every == 0:
@@ -261,16 +275,51 @@ def train(
             torch.save(checkpoint, output_path)
             print(f"  Saved checkpoint to {output_path}")
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            # Best model: prefer val loss if available, else train loss
+            compare_loss = val_loss if val_loss is not None else avg_loss
+            if compare_loss < best_val_loss:
+                best_val_loss = compare_loss
                 best_path = output_path.replace(".pt", "_best.pt")
                 torch.save(checkpoint, best_path)
-                print(f"  New best model: {best_path}")
+                print(f"  New best model: {best_path} "
+                      f"({'val' if val_loss is not None else 'train'}_loss={compare_loss:.6f})")
 
     if writer:
         writer.close()
 
-    print(f"\nTraining complete. Best loss: {best_loss:.6f}")
+    print(f"\nTraining complete. Best loss: {best_val_loss:.6f}")
+
+
+@torch.no_grad()
+def _evaluate(
+    model: ChessTransformer,
+    val_loader: DataLoader,
+    config: TrainingConfig,
+    device: torch.device,
+) -> float:
+    """Run validation and return average loss."""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+
+    for boards, values, policies in val_loader:
+        boards = boards.to(device)
+        values = values.to(device)
+        policies = policies.to(device)
+
+        pred_value, pred_policy = model(boards)
+        pred_value = pred_value.squeeze(-1)
+
+        value_loss = F.mse_loss(pred_value, values)
+        policy_loss = F.cross_entropy(pred_policy, policies)
+        loss = (config.value_loss_weight * value_loss +
+                config.policy_loss_weight * policy_loss)
+
+        total_loss += loss.item() * boards.size(0)
+        total_samples += boards.size(0)
+
+    model.train()
+    return total_loss / total_samples
 
 
 def main():
@@ -284,6 +333,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lazy", action="store_true", help="Lazy data loading (low RAM)")
     parser.add_argument("--log-dir", default="runs/", help="TensorBoard log dir")
+    parser.add_argument("--val-fraction", type=float, default=0.05,
+                        help="Fraction of data for validation (default: 0.05)")
     args = parser.parse_args()
 
     # Device
@@ -310,22 +361,51 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.lr,
         epochs=args.epochs,
+        val_fraction=args.val_fraction,
     )
-    loader = DataLoader(
-        dataset,
+
+    # Train/val split
+    val_loader = None
+    if train_config.val_fraction > 0:
+        val_size = max(1, int(len(dataset) * train_config.val_fraction))
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        print(f"Split: {train_size:,} train, {val_size:,} val")
+    else:
+        train_dataset = dataset
+
+    # Lazy mode: num_workers=0 for better LRU cache hit rate
+    num_workers = 0 if args.lazy else train_config.num_workers
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=train_config.batch_size,
         shuffle=True,
-        num_workers=train_config.num_workers,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
-    print(f"Batches per epoch: {len(loader)}")
+
+    if train_config.val_fraction > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+    print(f"Batches per epoch: {len(train_loader)}")
 
     # Create output directory
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     # Train
-    train(model, loader, train_config, args.output, device, args.log_dir)
+    train(model, train_loader, train_config, args.output, device,
+          args.log_dir, val_loader)
 
 
 if __name__ == "__main__":

@@ -395,15 +395,16 @@ class StockfishEvaluator:
             if token in line:
                 return lines
 
-    def evaluate(self, fen: str) -> Optional[float]:
+    def evaluate(self, fen: str) -> Optional[tuple[float, str]]:
         """
-        Evaluate a position and return centipawns from side-to-move perspective.
+        Evaluate a position and return (centipawns, best_move_uci).
         Returns None if evaluation fails. Mate scores converted to ±10000.
         """
         self._send(f"position fen {fen}")
         self._send(f"go depth {self.depth}")
 
         score_cp = None
+        best_move = None
         lines = self._wait_for("bestmove")
 
         for line in lines:
@@ -422,8 +423,14 @@ class StockfishEvaluator:
                     score_cp = 10000 if mate_in > 0 else -10000
                 except (ValueError, IndexError):
                     pass
+            if line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] != "(none)":
+                    best_move = parts[1]
 
-        return score_cp
+        if score_cp is None:
+            return None
+        return (score_cp, best_move)
 
     def evaluate_batch(self, fens: list[str]) -> list[Optional[float]]:
         """Evaluate a batch of positions sequentially."""
@@ -472,9 +479,10 @@ def _evaluate_worker(
             batch_id, fens = item
             results = []
             for fen in fens:
-                cp = sf.evaluate(fen)
-                if cp is not None:
-                    results.append((fen, cp_to_value(cp)))
+                result = sf.evaluate(fen)
+                if result is not None:
+                    cp, best_move = result
+                    results.append((fen, cp_to_value(cp), best_move))
             result_queue.put((batch_id, results))
 
 
@@ -713,29 +721,34 @@ class SyntheticGenerator:
                     for i, batch in enumerate(batches):
                         work_queue.put((i, batch))
 
-                    results: list[tuple[str, float]] = []
+                    results: list[tuple[str, float, str]] = []
                     for _ in range(len(batches)):
                         _, batch_results = result_queue.get()
                         results.extend(batch_results)
                 else:
                     results = []
                     for fen in fens:
-                        cp = sf_single.evaluate(fen)
-                        if cp is not None:
-                            results.append((fen, cp_to_value(cp)))
+                        result = sf_single.evaluate(fen)
+                        if result is not None:
+                            cp, best_move = result
+                            results.append((fen, cp_to_value(cp), best_move))
 
                 stats[config.name] = len(results)
 
                 # Encode positions into buffer
-                for fen, value in results:
+                for fen, value, best_move_uci in results:
                     board = chess.Board(fen)
                     features = board_to_tensor(board)
-                    legal_moves = list(board.legal_moves)
-                    if legal_moves:
-                        move = random.choice(legal_moves)
-                        policy_idx = move_to_index(move)
-                    else:
-                        policy_idx = 0
+
+                    # Use Stockfish's best move as policy target
+                    policy_idx = 0
+                    if best_move_uci:
+                        try:
+                            sf_move = chess.Move.from_uci(best_move_uci)
+                            if sf_move in board.legal_moves:
+                                policy_idx = move_to_index(sf_move)
+                        except ValueError:
+                            pass
 
                     boards_buf.append(features)
                     values_buf.append(value)

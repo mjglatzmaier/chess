@@ -150,9 +150,16 @@ def _save_chunk(output_dir, chunk_idx, boards, values, policies):
     boards_array = np.stack(boards, axis=0)
     values_array = np.array(values, dtype=np.float32)
     policy_array = np.array(policies, dtype=np.int64)
+    n = len(boards)
+    sources_array = np.zeros(n, dtype=np.uint8)   # 0 = ccrl
+    weights_array = np.ones(n, dtype=np.float32)   # uniform weight
 
     path = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.npz")
-    np.savez_compressed(path, boards=boards_array, values=values_array, policies=policy_array)
+    np.savez_compressed(
+        path,
+        boards=boards_array, values=values_array, policies=policy_array,
+        sources=sources_array, weights=weights_array,
+    )
     tqdm.write(f"  Saved chunk {chunk_idx}: {len(boards):,} positions")
 
 

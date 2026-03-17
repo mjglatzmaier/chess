@@ -18,8 +18,8 @@ class ModelConfig:
     num_heads: int = 4
     ff_dim: int = 512       # feed-forward hidden dimension
     dropout: float = 0.1
-    num_squares: int = 64
-    num_input_features: int = 25  # 12 piece planes + 1 stm + 4 castling + 8 ep
+    num_squares: int = 65   # 64 board squares + 1 global context token
+    num_input_features: int = 27  # 13 per-square + 14 global (zero-padded)
     num_policy_moves: int = 4096  # 64 * 64 from-to pairs
 
     @property
@@ -32,7 +32,7 @@ class TrainingConfig:
     """Training hyperparameters."""
     batch_size: int = 256
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
+    weight_decay: float = 0.01
     epochs: int = 10
     warmup_steps: int = 1000
     value_loss_weight: float = 1.0
@@ -41,6 +41,7 @@ class TrainingConfig:
     save_every: int = 1       # save checkpoint every N epochs
     eval_every: int = 1       # evaluate every N epochs
     num_workers: int = 4      # data loader workers
+    val_fraction: float = 0.05  # fraction of data held out for validation
 
 
 # Pre-defined model sizes
