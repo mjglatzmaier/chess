@@ -17,6 +17,7 @@ Usage:
 import argparse
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -31,11 +32,20 @@ from config import TrainingConfig, MODEL_CONFIGS
 
 
 class ChessDataset(Dataset):
-    """Load training data from .npz chunks — lazy mode for large datasets."""
+    """
+    Load training data from .npz chunks.
 
-    def __init__(self, data_dir: str, lazy: bool = False):
+    Supports two modes:
+    - Eager (default): loads all chunks into RAM. Fast but memory-heavy.
+    - Lazy: LRU cache of N chunks in memory, loads on demand.
+      Uses bisect for O(log n) chunk lookup instead of linear scan.
+      Suitable for 12M+ positions with <4GB RAM.
+    """
+
+    def __init__(self, data_dir: str, lazy: bool = False, chunk_cache_size: int = 3):
         self.data_dir = data_dir
         self.lazy = lazy
+        self.chunk_cache_size = chunk_cache_size
 
         # Load metadata
         meta_path = os.path.join(data_dir, "metadata.npz")
@@ -58,7 +68,6 @@ class ChessDataset(Dataset):
             if not os.path.exists(path):
                 break
             self.chunk_paths.append(path)
-            # Peek at chunk size without loading arrays
             with np.load(path) as data:
                 sz = len(data["values"])
             self.chunk_sizes.append(sz)
@@ -69,13 +78,10 @@ class ChessDataset(Dataset):
         self.num_chunks = len(self.chunk_paths)
 
         if lazy:
-            # Lazy mode: load chunks on demand, cache the most recent
-            self._cached_chunk_idx = -1
-            self._cached_boards = None
-            self._cached_values = None
-            self._cached_policies = None
+            # LRU cache: OrderedDict of chunk_idx -> (boards, values, policies)
+            self._chunk_cache: OrderedDict[int, tuple] = OrderedDict()
             print(f"Lazy dataset: {self.total_size:,} positions in {self.num_chunks} chunks "
-                  f"(policy: {'yes' if self.has_policy else 'no'})")
+                  f"(cache={chunk_cache_size}, policy: {'yes' if self.has_policy else 'no'})")
         else:
             # Eager mode: load everything into memory
             print(f"Loading {self.num_chunks} chunks from {data_dir}...")
@@ -93,23 +99,34 @@ class ChessDataset(Dataset):
             print(f"Loaded {self.total_size:,} positions "
                   f"(policy: {'yes' if self.policies is not None else 'no'})")
 
-    def _load_chunk(self, chunk_idx: int) -> None:
-        """Load a chunk into cache (lazy mode only)."""
-        if chunk_idx == self._cached_chunk_idx:
-            return
+    def _load_chunk(self, chunk_idx: int) -> tuple:
+        """Load a chunk into the LRU cache and return (boards, values, policies)."""
+        if chunk_idx in self._chunk_cache:
+            # Move to end (most recently used)
+            self._chunk_cache.move_to_end(chunk_idx)
+            return self._chunk_cache[chunk_idx]
+
+        # Evict oldest if cache is full
+        while len(self._chunk_cache) >= self.chunk_cache_size:
+            self._chunk_cache.popitem(last=False)
+
         data = np.load(self.chunk_paths[chunk_idx])
-        self._cached_boards = data["boards"]
-        self._cached_values = data["values"]
-        self._cached_policies = data["policies"] if "policies" in data else None
-        self._cached_chunk_idx = chunk_idx
+        entry = (
+            data["boards"],
+            data["values"],
+            data["policies"] if "policies" in data else None,
+        )
+        self._chunk_cache[chunk_idx] = entry
+        return entry
 
     def _find_chunk(self, idx: int) -> tuple[int, int]:
-        """Find which chunk contains global index idx, and the local offset."""
-        for ci, cum in enumerate(self.cumulative_sizes):
-            if idx < cum:
-                local = idx - (self.cumulative_sizes[ci - 1] if ci > 0 else 0)
-                return ci, local
-        raise IndexError(f"Index {idx} out of range")
+        """Find which chunk contains global index idx using bisect (O(log n))."""
+        import bisect
+        ci = bisect.bisect_right(self.cumulative_sizes, idx)
+        if ci >= self.num_chunks:
+            raise IndexError(f"Index {idx} out of range (total: {self.total_size})")
+        local = idx - (self.cumulative_sizes[ci - 1] if ci > 0 else 0)
+        return ci, local
 
     def __len__(self) -> int:
         return self.total_size
@@ -117,10 +134,10 @@ class ChessDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.lazy:
             ci, local = self._find_chunk(idx)
-            self._load_chunk(ci)
-            board = torch.from_numpy(self._cached_boards[local].copy())
-            value = torch.tensor(self._cached_values[local])
-            pol = self._cached_policies[local] if self._cached_policies is not None else 0
+            boards, values, policies = self._load_chunk(ci)
+            board = torch.from_numpy(boards[local].copy())
+            value = torch.tensor(values[local])
+            pol = policies[local] if policies is not None else 0
             policy = torch.tensor(pol, dtype=torch.long)
         else:
             board = torch.from_numpy(self.boards[idx])
