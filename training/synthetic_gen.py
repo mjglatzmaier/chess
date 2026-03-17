@@ -5,10 +5,30 @@ Generates random legal positions with controlled material configurations,
 evaluates them with Stockfish, and saves as training data chunks. This fills
 gaps in the CCRL data — material imbalances, rare endgames, edge cases.
 
+Material configs are generated systematically from 3 dimensions:
+  - Base imbalances: Q up, Q vs pieces, R up, R vs minor, etc. (42 combos)
+  - Pawn overlays: 0-2 extra pawns per side (8 combos)
+  - Phase backgrounds: endgame / late-middle / middlegame / early-middle (4)
+This produces ~1000 unique configs covering broad imbalance × phase space.
+
+Performance notes:
+  - Persistent worker processes each run a long-lived Stockfish instance
+    (no per-config spawn overhead, hash tables preserved across positions).
+  - Checkpoints after each config — interrupt and resume safely.
+  - Use --threads equal to your CPU core count for best throughput.
+
 Usage:
-    python synthetic_gen.py --stockfish /path/to/stockfish --output data/synthetic/
-    python synthetic_gen.py --stockfish stockfish --depth 20 --threads 8
-    python synthetic_gen.py --stockfish stockfish --configs KQvK KRvK --num 500
+    # List all configs (no Stockfish needed)
+    python synthetic_gen.py --list-configs
+
+    # Full generation
+    python synthetic_gen.py --stockfish stockfish --output data/synthetic/ --depth 20 --threads 12
+
+    # Quick smoke test
+    python synthetic_gen.py --stockfish stockfish --configs KQvK KRvK --num 10 --depth 6
+
+    # Resume interrupted run (same command)
+    python synthetic_gen.py --stockfish stockfish --output data/synthetic/ --depth 20 --threads 12
 """
 
 import argparse
