@@ -28,6 +28,7 @@ from synthetic_gen import (
     cp_to_value,
     generate_random_position,
     generate_positions_for_config,
+    generate_default_configs,
     PIECE_MAP,
     DEFAULT_CONFIGS,
 )
@@ -162,7 +163,7 @@ class TestCpToValue:
 
 
 class TestMaterialConfig:
-    """Test MaterialConfig dataclass."""
+    """Test MaterialConfig dataclass and systematic generation."""
 
     def test_piece_lists(self):
         config = MaterialConfig("KQvKR", "KQ", "KR")
@@ -179,6 +180,41 @@ class TestMaterialConfig:
             # Both sides must have a king
             assert "K" in config.white_pieces
             assert "K" in config.black_pieces
+
+    def test_systematic_generation_count(self):
+        """Systematic generator should produce 300+ configs with phases."""
+        configs = generate_default_configs(
+            positions_per_config=100, include_phases=True, max_pawn_overlay=2,
+        )
+        assert len(configs) >= 200, f"Expected 200+, got {len(configs)}"
+
+    def test_systematic_no_phases(self):
+        """Without phases, should produce fewer configs."""
+        with_phases = generate_default_configs(include_phases=True)
+        without_phases = generate_default_configs(include_phases=False)
+        assert len(without_phases) < len(with_phases)
+        assert len(without_phases) >= 50
+
+    def test_no_equal_material(self):
+        """Systematic configs should not include equal-material positions."""
+        for cfg in DEFAULT_CONFIGS:
+            w = cfg.white_pieces.replace("K", "")
+            b = cfg.black_pieces.replace("K", "")
+            # The piece sets should differ (that's the point of imbalance coverage)
+            assert w != b or w == "", (
+                f"Config {cfg.name} has equal material: {w} vs {b}"
+            )
+
+    def test_no_duplicate_names(self):
+        """Config names should be unique."""
+        names = [c.name for c in DEFAULT_CONFIGS]
+        assert len(names) == len(set(names)), "Duplicate config names found"
+
+    def test_max_pieces_limit(self):
+        """No config should have more than 8 pieces per side."""
+        for cfg in DEFAULT_CONFIGS:
+            assert len(cfg.white_pieces) <= 8, f"{cfg.name} white has {len(cfg.white_pieces)} pieces"
+            assert len(cfg.black_pieces) <= 8, f"{cfg.name} black has {len(cfg.black_pieces)} pieces"
 
 
 # ===========================

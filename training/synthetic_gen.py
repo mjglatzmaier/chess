@@ -60,46 +60,152 @@ class MaterialConfig:
         return [PIECE_MAP[c] for c in self.black_pieces]
 
 
-# Standard set of material configurations covering key gaps
-DEFAULT_CONFIGS = [
-    # Queen odds — magnitude calibration
-    MaterialConfig("KQvK", "KQ", "K", 1000, "queen_odds"),
-    MaterialConfig("KQPvKP", "KQP", "KP", 1000, "queen_odds"),
-    MaterialConfig("KQvKR", "KQ", "KR", 1000, "queen_odds"),
+# ---------------------------------------------------------------------------
+# Systematic config generation
+# ---------------------------------------------------------------------------
 
-    # Rook odds — endgame eval
-    MaterialConfig("KRvK", "KR", "K", 1000, "rook_odds"),
-    MaterialConfig("KRPvKP", "KRP", "KP", 1000, "rook_odds"),
-    MaterialConfig("KRRvKR", "KRR", "KR", 1000, "rook_odds"),
+# Base imbalances: (stronger_pieces, weaker_pieces, category)
+# These define the *piece* advantage without pawns. Kings are implicit.
+_BASE_IMBALANCES = [
+    # Queen advantage
+    ("Q", "",     "queen_up"),
+    ("Q", "R",    "queen_up"),
+    ("Q", "B",    "queen_up"),
+    ("Q", "N",    "queen_up"),
+    ("Q", "BB",   "queen_vs_pieces"),
+    ("Q", "BN",   "queen_vs_pieces"),
+    ("Q", "NN",   "queen_vs_pieces"),
+    ("Q", "RB",   "queen_vs_pieces"),
+    ("Q", "RN",   "queen_vs_pieces"),
+    ("Q", "RR",   "queen_vs_pieces"),
+    ("Q", "BBN",  "queen_vs_pieces"),
+    ("Q", "BNN",  "queen_vs_pieces"),
+    ("Q", "RBN",  "queen_vs_pieces"),
 
-    # Minor piece odds — draw recognition
-    MaterialConfig("KBvK", "KB", "K", 1000, "minor_odds"),
-    MaterialConfig("KNvK", "KN", "K", 1000, "minor_odds"),
-    MaterialConfig("KBNvK", "KBN", "K", 1000, "minor_odds"),
-    MaterialConfig("KBBvK", "KBB", "K", 1000, "minor_odds"),
+    # Rook advantage
+    ("R", "",     "rook_up"),
+    ("R", "B",    "rook_vs_minor"),
+    ("R", "N",    "rook_vs_minor"),
+    ("RR", "R",   "rook_up"),
+    ("R", "BN",   "rook_vs_pieces"),
+    ("R", "NN",   "rook_vs_pieces"),
+    ("R", "BB",   "rook_vs_pieces"),
+    ("RR", "BN",  "rook_vs_pieces"),
+    ("RR", "BB",  "rook_vs_pieces"),
+    ("RR", "NN",  "rook_vs_pieces"),
 
-    # Pawn endgames
-    MaterialConfig("KPvK", "KP", "K", 1000, "pawn_endgame"),
-    MaterialConfig("KPPvK", "KPP", "K", 1000, "pawn_endgame"),
-    MaterialConfig("KPPPvKN", "KPPP", "KN", 1000, "pawn_endgame"),
-    MaterialConfig("KPvKP", "KP", "KP", 1000, "pawn_endgame"),
+    # Minor piece advantage
+    ("B", "",     "minor_up"),
+    ("N", "",     "minor_up"),
+    ("BN", "",    "minor_pair_up"),
+    ("BB", "",    "minor_pair_up"),
+    ("NN", "",    "minor_pair_up"),
+    ("BN", "B",   "minor_up"),
+    ("BN", "N",   "minor_up"),
+    ("BB", "N",   "minor_up"),
 
-    # Piece vs pawns — material tradeoffs
-    MaterialConfig("KRvKPP", "KR", "KPP", 1000, "piece_vs_pawns"),
-    MaterialConfig("KBvKPP", "KB", "KPP", 1000, "piece_vs_pawns"),
-    MaterialConfig("KNvKPP", "KN", "KPP", 1000, "piece_vs_pawns"),
-
-    # Mutual imbalance — piece coordination
-    MaterialConfig("KRBvKRN", "KRB", "KRN", 1000, "mutual_imbalance"),
-    MaterialConfig("KQvKRR", "KQ", "KRR", 1000, "mutual_imbalance"),
-    MaterialConfig("KRNvKRB", "KRN", "KRB", 1000, "mutual_imbalance"),
-    MaterialConfig("KQvKRB", "KQ", "KRB", 1000, "mutual_imbalance"),
-    MaterialConfig("KQvKRN", "KQ", "KRN", 1000, "mutual_imbalance"),
-
-    # Extreme — promotions, multiple queens
-    MaterialConfig("KQQvKQ", "KQQ", "KQ", 500, "extreme"),
-    MaterialConfig("KQRvK", "KQR", "K", 500, "extreme"),
+    # Piece vs pawns (weaker side has only pawns as compensation)
+    ("Q", "PPP",  "piece_vs_pawns"),
+    ("Q", "PPPP", "piece_vs_pawns"),
+    ("Q", "PPPPP","piece_vs_pawns"),
+    ("R", "PP",   "piece_vs_pawns"),
+    ("R", "PPP",  "piece_vs_pawns"),
+    ("R", "PPPP", "piece_vs_pawns"),
+    ("B", "PP",   "piece_vs_pawns"),
+    ("B", "PPP",  "piece_vs_pawns"),
+    ("N", "PP",   "piece_vs_pawns"),
+    ("N", "PPP",  "piece_vs_pawns"),
 ]
+
+# Pawn imbalance overlays: (white_extra_pawns, black_extra_pawns)
+# Applied on top of base imbalances to vary pawn structure
+_PAWN_OVERLAYS = [
+    (0, 0),   # pure piece imbalance
+    (1, 0),   # stronger side +1P
+    (0, 1),   # weaker side +1P (partial compensation)
+    (1, 1),   # both +1P
+    (2, 0),   # stronger side +2P
+    (0, 2),   # weaker side +2P
+    (2, 1),   # asymmetric
+    (1, 2),   # weaker side has pawn compensation
+]
+
+# Background piece sets to simulate game phases
+# Added to BOTH sides equally (no material change, just density)
+_PHASE_BACKGROUNDS = [
+    ("",    "",    "endgame"),       # pure endgame (no extras)
+    ("R",   "R",   "late_middle"),   # late middlegame density
+    ("RB",  "RB",  "middlegame"),    # middlegame density
+    ("RBN", "RBN", "early_middle"),  # early middlegame density
+]
+
+# Max total pieces per side (king + pieces + pawns) before position
+# generation becomes unreliable due to board crowding
+_MAX_PIECES_PER_SIDE = 8
+
+
+def _build_config(
+    w_pieces: str, b_pieces: str, category: str, num_positions: int,
+) -> MaterialConfig:
+    """Build a MaterialConfig with auto-generated name."""
+    w_sorted = "K" + "".join(sorted(w_pieces.replace("K", ""), key="QRBNP".index))
+    b_sorted = "K" + "".join(sorted(b_pieces.replace("K", ""), key="QRBNP".index))
+    name = f"{w_sorted}v{b_sorted}"
+    return MaterialConfig(name, w_sorted, b_sorted, num_positions, category)
+
+
+def generate_default_configs(
+    positions_per_config: int = 500,
+    include_phases: bool = True,
+    max_pawn_overlay: int = 2,
+) -> list[MaterialConfig]:
+    """
+    Systematically generate material configurations covering:
+    - All base imbalances (piece advantages, piece-vs-pawns)
+    - Pawn count variations (0-2 extra pawns per side)
+    - Phase simulation (endgame through middlegame density)
+
+    This produces ~300-500 configs targeting broad imbalance coverage.
+    """
+    seen: set[str] = set()
+    configs: list[MaterialConfig] = []
+
+    for stronger, weaker, base_cat in _BASE_IMBALANCES:
+        # Filter pawn overlays by max_pawn_overlay
+        overlays = [(wp, bp) for wp, bp in _PAWN_OVERLAYS
+                     if wp <= max_pawn_overlay and bp <= max_pawn_overlay]
+
+        phases = _PHASE_BACKGROUNDS if include_phases else [("", "", "endgame")]
+
+        for extra_wp, extra_bp in overlays:
+            for bg_w, bg_b, phase in phases:
+                # Build piece strings (without king — added by _build_config)
+                w_pieces = stronger + bg_w + "P" * extra_wp
+                b_pieces = weaker + bg_b + "P" * extra_bp
+
+                # Check piece count limits
+                if len(w_pieces) + 1 > _MAX_PIECES_PER_SIDE:
+                    continue
+                if len(b_pieces) + 1 > _MAX_PIECES_PER_SIDE:
+                    continue
+
+                category = f"{base_cat}/{phase}"
+                cfg = _build_config(w_pieces, b_pieces, category, positions_per_config)
+
+                # Deduplicate
+                if cfg.name not in seen:
+                    seen.add(cfg.name)
+                    configs.append(cfg)
+
+    return configs
+
+
+# Default configs: systematic coverage
+DEFAULT_CONFIGS = generate_default_configs(
+    positions_per_config=500,
+    include_phases=True,
+    max_pawn_overlay=2,
+)
 
 
 def get_config_by_name(name: str) -> Optional[MaterialConfig]:
@@ -514,7 +620,7 @@ class SyntheticGenerator:
         print(f"Output: {output_dir}/")
         print("\nPer-config breakdown:")
         for name, count in sorted(stats.items(), key=lambda x: -x[1]):
-            print(f"  {name:<20} {count:>6,}")
+            print(f"  {name:<30} {count:>6,}")
 
         stats["total"] = total_positions
         stats["chunks"] = chunk_idx
@@ -552,8 +658,8 @@ def main():
         description="Generate synthetic chess positions with Stockfish evaluation"
     )
     parser.add_argument(
-        "--stockfish", required=True,
-        help="Path to Stockfish binary",
+        "--stockfish", default=None,
+        help="Path to Stockfish binary (required for generation)",
     )
     parser.add_argument(
         "--output", default="data/synthetic/",
@@ -572,17 +678,56 @@ def main():
         help="Specific configs to generate (e.g., KQvK KRvK). Default: all",
     )
     parser.add_argument(
+        "--category", default=None,
+        help="Filter configs by category prefix (e.g., queen_up, rook_vs_minor)",
+    )
+    parser.add_argument(
         "--num", type=int, default=None,
         help="Override num_positions per config",
+    )
+    parser.add_argument(
+        "--no-phases", action="store_true",
+        help="Skip phase backgrounds (endgame only — faster, fewer configs)",
+    )
+    parser.add_argument(
+        "--max-pawn-overlay", type=int, default=2,
+        help="Max extra pawns per side in overlays (default: 2)",
     )
     parser.add_argument(
         "--chunk-size", type=int, default=100_000,
         help="Positions per chunk (default: 100000)",
     )
+    parser.add_argument(
+        "--list-configs", action="store_true",
+        help="Print all configs and exit (no generation)",
+    )
     args = parser.parse_args()
+
+    # Build config set with generation parameters
+    all_configs = generate_default_configs(
+        positions_per_config=args.num or 500,
+        include_phases=not args.no_phases,
+        max_pawn_overlay=args.max_pawn_overlay,
+    )
+
+    # --list-configs: print and exit
+    if args.list_configs:
+        categories: dict[str, list[str]] = {}
+        for cfg in all_configs:
+            categories.setdefault(cfg.category, []).append(cfg.name)
+        print(f"Total configs: {len(all_configs)}, "
+              f"target positions: {sum(c.num_positions for c in all_configs):,}\n")
+        for cat in sorted(categories):
+            names = categories[cat]
+            print(f"  {cat} ({len(names)}):")
+            for name in names:
+                print(f"    {name}")
+        sys.exit(0)
 
     # Verify Stockfish exists
     sf_path = args.stockfish
+    if sf_path is None:
+        parser.error("--stockfish is required for generation (use --list-configs to browse)")
     try:
         result = subprocess.run(
             [sf_path], stdout=subprocess.PIPE,
@@ -599,14 +744,20 @@ def main():
             cfg = get_config_by_name(name)
             if cfg is None:
                 print(f"Unknown config: {name}")
-                print(f"Available: {[c.name for c in DEFAULT_CONFIGS]}")
+                print("Use --list-configs to see available configs")
                 sys.exit(1)
             configs.append(cfg)
+    elif args.category:
+        configs = [c for c in all_configs if c.category.startswith(args.category)]
+        if not configs:
+            print(f"No configs match category '{args.category}'")
+            print("Use --list-configs to see available categories")
+            sys.exit(1)
     else:
-        configs = list(DEFAULT_CONFIGS)
+        configs = all_configs
 
-    # Override num_positions if specified
-    if args.num is not None:
+    # Override num_positions if specified and using named configs
+    if args.num is not None and args.configs:
         for cfg in configs:
             cfg.num_positions = args.num
 
