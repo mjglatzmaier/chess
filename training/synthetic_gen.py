@@ -585,7 +585,7 @@ def main():
     sf_path = args.stockfish
     try:
         result = subprocess.run(
-            [sf_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [sf_path], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=5, input="quit\n", text=True,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
