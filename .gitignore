@@ -18,7 +18,9 @@
 #misc
 *.tar
 *.tar.gz
-
+*.pyc
+*.epd
+*.pt
 
 #directories
 x64/*
@@ -28,5 +30,7 @@ packages/*
 build/*
 haVoc/*
 .vscode/*
+training/*.txt
+training/runs/*
 training/data/*
 training/labels/*
