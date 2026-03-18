@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import os
 
@@ -83,10 +84,12 @@ def process_pgn(
         chunk_idx = 0
         file_offset = 0
 
-    # Pre-allocate chunk buffers
+    # Pre-allocate chunk buffers (reused across chunks)
     boards_buf = np.zeros((chunk_size, 65, num_features), dtype=np.float32)
     values_buf = np.zeros(chunk_size, dtype=np.float32)
     policy_buf = np.zeros(chunk_size, dtype=np.int64)
+    sources_buf = np.zeros(chunk_size, dtype=np.uint8)
+    weights_buf = np.ones(chunk_size, dtype=np.float32)
     buf_idx = 0
 
     pgn_file = open(pgn_path, errors="replace")
@@ -151,10 +154,9 @@ def process_pgn(
 
             if buf_idx >= chunk_size:
                 _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
-                            policy_buf, buf_idx)
+                            policy_buf, sources_buf, weights_buf, buf_idx)
                 chunk_idx += 1
                 buf_idx = 0
-                boards_buf[:] = 0
 
                 _save_checkpoint(output_dir, {
                     "total_games": total_games,
@@ -163,6 +165,7 @@ def process_pgn(
                     "chunk_idx": chunk_idx,
                     "file_offset": game_offset,
                 })
+                gc.collect()
 
         total_games += 1
         pbar.update(1)
@@ -176,7 +179,7 @@ def process_pgn(
 
     if buf_idx > 0:
         _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
-                    policy_buf, buf_idx)
+                    policy_buf, sources_buf, weights_buf, buf_idx)
         chunk_idx += 1
 
     metadata = {
@@ -202,16 +205,14 @@ def process_pgn(
     print(f"Output: {output_dir}/")
 
 
-def _save_chunk(output_dir, chunk_idx, boards, values, policies, count):
+def _save_chunk(output_dir, chunk_idx, boards, values, policies,
+                sources, weights, count):
     n = count
-    sources_array = np.zeros(n, dtype=np.uint8)   # 0 = ccrl
-    weights_array = np.ones(n, dtype=np.float32)   # uniform weight
-
     path = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.npz")
-    np.savez(
+    np.savez_compressed(
         path,
         boards=boards[:n], values=values[:n], policies=policies[:n],
-        sources=sources_array, weights=weights_array,
+        sources=sources[:n], weights=weights[:n],
     )
 
 
