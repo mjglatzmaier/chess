@@ -43,20 +43,21 @@ use either NNUE+alpha-beta or CNN+MCTS, but not transformer+alpha-beta.
 ## Network Architecture
 
 ```
-Input Encoding (per square):
-  12 piece planes (P,N,B,R,Q,K × white,black)  →  one-hot
-  + side-to-move (1 bit, broadcast)
-  + castling rights (4 bits, broadcast)
-  + en passant file (8 bits, broadcast)
-  Total: 25 features per square → projected to embed_dim
+Input Encoding:
+  64 square tokens (13 features each):
+    12 piece planes (P,N,B,R,Q,K × white,black)  →  one-hot
+    + 1 side-to-move bit
+  + 1 global context token (14 features):
+    castling rights (4 bits) + en passant file (8 bits) + side-to-move + empty
+  Total: 65 tokens × up to 27 features → projected to embed_dim
 
 Transformer Encoder:
-  [64 square tokens] → Linear(25, embed_dim) + positional encoding
+  [65 tokens] → Linear(27, embed_dim) + positional encoding
   → N × TransformerEncoderLayer(embed_dim, num_heads, ff_dim)
-  → pooled output (mean of all tokens)
+  → global context token output
 
 Value Head:
-  pooled → Linear(embed_dim, 1) → tanh → [-1, +1]
+  context token → Linear(embed_dim, 1) → tanh → [-1, +1]
   Represents win probability: +1 = white wins, -1 = black wins
 
 Policy Head:
@@ -264,8 +265,9 @@ training/
 ├── ARCHITECTURE.md          # Detailed design rationale
 ├── requirements.txt         # Python dependencies
 ├── config.py                # Hyperparameter configs (model sizes, training)
-├── encoding.py              # Board ↔ tensor conversion (25-dim per square)
+├── encoding.py              # Board ↔ tensor conversion (13-dim per square + global context token)
 ├── model.py                 # Transformer architecture (value + policy heads)
+├── PIPELINE.md              # Quick-reference e2e data gen + training commands
 ├── prepare_data.py          # PGN/EPD → .npz training chunks
 ├── synthetic_gen.py         # Synthetic position generator with Stockfish eval
 ├── data_mixer.py            # Multi-source dataset mixer with ratio sampling

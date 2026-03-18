@@ -28,3 +28,5 @@ packages/*
 build/*
 haVoc/*
 .vscode/*
+training/data/*
+training/labels/*

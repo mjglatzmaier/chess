@@ -8,12 +8,15 @@ played) -- supervised learning from strong engine games.
 This is analogous to next-token prediction in LLMs: given the board state,
 predict the move a strong engine would play.
 
+Supports checkpointing — re-run the same command to resume an interrupted run.
+
 Usage:
     python prepare_data.py games.pgn --output data/round_0/
-    python prepare_data.py games.pgn --output data/round_0/ --max-games 50000
+    python prepare_data.py games.pgn --output data/round_0/ --max-games 250000
 """
 
 import argparse
+import json
 import os
 
 import chess
@@ -21,7 +24,25 @@ import chess.pgn
 import numpy as np
 from tqdm import tqdm
 
-from encoding import board_to_tensor, move_to_index, NUM_FEATURES
+from encoding import board_to_tensor, move_to_index, NUM_FEATURES, NUM_GLOBAL_FEATURES
+
+CHECKPOINT_FILE = "checkpoint.json"
+
+
+def _load_checkpoint(output_dir: str) -> dict | None:
+    path = os.path.join(output_dir, CHECKPOINT_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_checkpoint(output_dir: str, state: dict) -> None:
+    path = os.path.join(output_dir, CHECKPOINT_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
 
 
 def process_pgn(
@@ -37,25 +58,49 @@ def process_pgn(
     Process a PGN file into training data.
 
     For each position in each game, saves:
-      - board: [64, 25] features
+      - board: [65, 27] features (64 squares + 1 global context token)
       - value: float in [-1, +1] (game outcome from side-to-move perspective)
       - policy: int in [0, 4095] (index of move actually played)
+
+    Checkpoints after each chunk so interrupted runs can be resumed.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    boards_buf = []
-    values_buf = []
-    policy_buf = []
+    num_features = NUM_FEATURES + NUM_GLOBAL_FEATURES
+    ckpt = _load_checkpoint(output_dir)
+    if ckpt is not None:
+        total_games = ckpt["total_games"]
+        total_positions = ckpt["total_positions"]
+        skipped_games = ckpt["skipped_games"]
+        chunk_idx = ckpt["chunk_idx"]
+        file_offset = ckpt["file_offset"]
+        print(f"Resuming from checkpoint: {total_games:,} games, "
+              f"{total_positions:,} positions, chunk {chunk_idx}")
+    else:
+        total_games = 0
+        total_positions = 0
+        skipped_games = 0
+        chunk_idx = 0
+        file_offset = 0
 
-    total_games = 0
-    total_positions = 0
-    skipped_games = 0
-    chunk_idx = 0
+    # Pre-allocate chunk buffers
+    boards_buf = np.zeros((chunk_size, 65, num_features), dtype=np.float32)
+    values_buf = np.zeros(chunk_size, dtype=np.float32)
+    policy_buf = np.zeros(chunk_size, dtype=np.int64)
+    buf_idx = 0
 
     pgn_file = open(pgn_path, errors="replace")
-    pbar = tqdm(desc="Games", unit=" games")
+    if file_offset > 0:
+        pgn_file.seek(file_offset)
+
+    target = f"/{max_games:,}" if max_games > 0 else ""
+    pbar = tqdm(
+        desc="Games", unit=" games", initial=total_games,
+        total=max_games if max_games > 0 else None, miniters=500,
+    )
 
     while True:
+        game_offset = pgn_file.tell()
         game = chess.pgn.read_game(pgn_file)
         if game is None:
             break
@@ -91,32 +136,37 @@ def process_pgn(
             move_num += 1
 
             if move_num > skip_moves and not board.is_check():
-                features = board_to_tensor(board)
+                boards_buf[buf_idx] = board_to_tensor(board)
 
                 if board.turn == chess.WHITE:
-                    value = 2.0 * result - 1.0
+                    values_buf[buf_idx] = 2.0 * result - 1.0
                 else:
-                    value = 2.0 * (1.0 - result) - 1.0
+                    values_buf[buf_idx] = 2.0 * (1.0 - result) - 1.0
 
-                policy_idx = move_to_index(move)
-
-                boards_buf.append(features)
-                values_buf.append(value)
-                policy_buf.append(policy_idx)
+                policy_buf[buf_idx] = move_to_index(move)
+                buf_idx += 1
                 total_positions += 1
 
             board.push(move)
 
-            if len(boards_buf) >= chunk_size:
-                _save_chunk(output_dir, chunk_idx, boards_buf, values_buf, policy_buf)
+            if buf_idx >= chunk_size:
+                _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
+                            policy_buf, buf_idx)
                 chunk_idx += 1
-                boards_buf = []
-                values_buf = []
-                policy_buf = []
+                buf_idx = 0
+                boards_buf[:] = 0
+
+                _save_checkpoint(output_dir, {
+                    "total_games": total_games,
+                    "total_positions": total_positions,
+                    "skipped_games": skipped_games,
+                    "chunk_idx": chunk_idx,
+                    "file_offset": game_offset,
+                })
 
         total_games += 1
         pbar.update(1)
-        pbar.set_postfix(positions=total_positions, skipped=skipped_games)
+        pbar.set_postfix(pos=f"{total_positions:,}", chunks=chunk_idx)
 
         if max_games > 0 and total_games >= max_games:
             break
@@ -124,8 +174,9 @@ def process_pgn(
     pbar.close()
     pgn_file.close()
 
-    if boards_buf:
-        _save_chunk(output_dir, chunk_idx, boards_buf, values_buf, policy_buf)
+    if buf_idx > 0:
+        _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
+                    policy_buf, buf_idx)
         chunk_idx += 1
 
     metadata = {
@@ -141,26 +192,27 @@ def process_pgn(
     }
     np.savez(os.path.join(output_dir, "metadata.npz"), **metadata)
 
+    # Clean up checkpoint on successful completion
+    ckpt_path = os.path.join(output_dir, CHECKPOINT_FILE)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
+
     print(f"\nDone: {total_games:,} games -> {total_positions:,} positions in {chunk_idx} chunks")
     print(f"Skipped: {skipped_games:,} games")
     print(f"Output: {output_dir}/")
 
 
-def _save_chunk(output_dir, chunk_idx, boards, values, policies):
-    boards_array = np.stack(boards, axis=0)
-    values_array = np.array(values, dtype=np.float32)
-    policy_array = np.array(policies, dtype=np.int64)
-    n = len(boards)
+def _save_chunk(output_dir, chunk_idx, boards, values, policies, count):
+    n = count
     sources_array = np.zeros(n, dtype=np.uint8)   # 0 = ccrl
     weights_array = np.ones(n, dtype=np.float32)   # uniform weight
 
     path = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.npz")
-    np.savez_compressed(
+    np.savez(
         path,
-        boards=boards_array, values=values_array, policies=policy_array,
+        boards=boards[:n], values=values[:n], policies=policies[:n],
         sources=sources_array, weights=weights_array,
     )
-    tqdm.write(f"  Saved chunk {chunk_idx}: {len(boards):,} positions")
 
 
 def main():
