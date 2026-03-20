@@ -196,6 +196,7 @@ class ProportionalSampler(Sampler):
 
     def __iter__(self):
         rng = random.Random(self.seed + self._epoch)
+        np_rng = np.random.default_rng(self.seed + self._epoch)
         self._epoch += 1
 
         # For each source, select random chunks to fill the target count
@@ -222,17 +223,15 @@ class ProportionalSampler(Sampler):
         # Shuffle chunk order for inter-chunk randomness
         rng.shuffle(chunk_groups)
 
-        # Yield indices: within each chunk, sample and shuffle
-        indices: list[int] = []
+        # Build indices with numpy for speed
+        arrays = []
         for start, chunk_size, take in chunk_groups:
-            if take >= chunk_size:
-                chunk_indices = list(range(start, start + chunk_size))
-            else:
-                chunk_indices = rng.sample(range(start, start + chunk_size), take)
-            rng.shuffle(chunk_indices)
-            indices.extend(chunk_indices)
+            arr = np_rng.choice(chunk_size, size=take, replace=False) + start
+            np_rng.shuffle(arr)
+            arrays.append(arr)
 
-        return iter(indices)
+        indices = np.concatenate(arrays)
+        return iter(indices.tolist())
 
     def __len__(self) -> int:
         return self.epoch_size
