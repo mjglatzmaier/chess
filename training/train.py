@@ -450,34 +450,58 @@ def main():
     sampler = None
 
     if use_mixed:
-        from data_mixer import DataMixer
-        print(f"\nMixed-source training:")
-        mixer = DataMixer(mix_sources)
-        dataset = mixer.dataset
-        epoch_size = args.epoch_size or dataset.total_size
-
-        # For mixed sources, split validation off from the largest source
-        # by reserving a fraction of its indices, then use proportional
-        # sampling on the training portion.
-        # Simpler approach: no val split for mixed mode (eval on separate data).
-        val_loader = None
-        if train_config.val_fraction > 0:
-            print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
-
-        from data_mixer import ProportionalSampler
-        sampler = ProportionalSampler(dataset, epoch_size=epoch_size)
-
-        num_workers = 0  # mixed mode uses LRU caching, workers hurt cache hits
-        train_loader = DataLoader(
-            dataset,
-            batch_size=train_config.batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
-            drop_last=True,
+        # Detect format: .h5 files → HDF5 dataset, directories → legacy npz
+        use_hdf5 = any(
+            path.endswith(".h5") for path, _ in mix_sources.values()
         )
-        print(f"  Epoch size: {epoch_size:,} positions")
-        print(f"  Batches per epoch: {len(train_loader)}")
+
+        if use_hdf5:
+            from hdf5_dataset import HDF5ChessDataset, HDF5ProportionalSampler
+            print(f"\nMixed-source training (HDF5):")
+            dataset = HDF5ChessDataset(mix_sources)
+            epoch_size = args.epoch_size or dataset.total_size
+
+            val_loader = None
+            if train_config.val_fraction > 0:
+                print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
+
+            sampler = HDF5ProportionalSampler(dataset, epoch_size=epoch_size)
+
+            num_workers = 0
+            train_loader = DataLoader(
+                dataset,
+                batch_size=train_config.batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=(device.type == "cuda"),
+                drop_last=True,
+            )
+            print(f"  Epoch size: {epoch_size:,} positions")
+            print(f"  Batches per epoch: {len(train_loader)}")
+        else:
+            from data_mixer import DataMixer, ProportionalSampler
+            print(f"\nMixed-source training (npz):")
+            mixer = DataMixer(mix_sources)
+            dataset = mixer.dataset
+            epoch_size = args.epoch_size or dataset.total_size
+
+            val_loader = None
+            if train_config.val_fraction > 0:
+                print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
+
+            sampler = ProportionalSampler(dataset, epoch_size=epoch_size)
+
+            num_workers = 0
+            train_loader = DataLoader(
+                dataset,
+                batch_size=train_config.batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=(device.type == "cuda"),
+                drop_last=True,
+            )
+            print(f"  Epoch size: {epoch_size:,} positions")
+            print(f"  Batches per epoch: {len(train_loader)}")
     else:
         # Single-source mode (original behavior)
         dataset = ChessDataset(args.data, lazy=args.lazy)
