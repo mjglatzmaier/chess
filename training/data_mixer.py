@@ -81,14 +81,34 @@ class MixedChessDataset(Dataset):
                 continue
 
             chunk_paths = sorted(Path(data_dir).glob("chunk_*.npz"))
-            for cpath in chunk_paths:
-                with np.load(str(cpath)) as data:
-                    sz = len(data["values"])
-                start_idx = total
-                self.entries.append((name, str(cpath), start_idx, sz))
-                total += sz
-                self.chunk_cumulative.append(total)
-                self.source_ranges[name].append((start_idx, total))
+
+            # Fast path: use metadata to avoid scanning every chunk
+            meta_path = os.path.join(data_dir, "metadata.npz")
+            if os.path.exists(meta_path):
+                meta = np.load(meta_path)
+                total_positions = int(meta["total_positions"])
+                num_chunks = int(meta["num_chunks"])
+                chunk_size = int(meta["chunk_size"])
+                # All chunks are chunk_size except possibly the last
+                for i, cpath in enumerate(chunk_paths[:num_chunks]):
+                    if i < num_chunks - 1:
+                        sz = chunk_size
+                    else:
+                        sz = total_positions - chunk_size * (num_chunks - 1)
+                    start_idx = total
+                    self.entries.append((name, str(cpath), start_idx, sz))
+                    total += sz
+                    self.chunk_cumulative.append(total)
+                    self.source_ranges[name].append((start_idx, total))
+            else:
+                for cpath in chunk_paths:
+                    with np.load(str(cpath)) as data:
+                        sz = len(data["values"])
+                    start_idx = total
+                    self.entries.append((name, str(cpath), start_idx, sz))
+                    total += sz
+                    self.chunk_cumulative.append(total)
+                    self.source_ranges[name].append((start_idx, total))
 
         self.total_size = total
         self._source_sizes: dict[str, int] = {
@@ -153,11 +173,13 @@ class MixedChessDataset(Dataset):
 
 class ProportionalSampler(Sampler):
     """
-    Sampler that draws from each source proportionally per epoch.
+    Chunk-aware sampler that draws from each source proportionally per epoch.
 
-    Instead of uniform random sampling (which would over-represent larger
-    sources), this sampler ensures each batch contains approximately the
-    target ratio of each source.
+    Instead of fully random indices (which thrash the chunk cache), this
+    sampler selects random chunks from each source, then yields all positions
+    from each chunk before moving to the next. Chunks are shuffled for
+    inter-chunk randomness; positions within each chunk are shuffled for
+    intra-chunk randomness. This keeps LRU cache hit rate near 100%.
     """
 
     def __init__(
@@ -175,22 +197,40 @@ class ProportionalSampler(Sampler):
         rng = random.Random(self.seed + self._epoch)
         self._epoch += 1
 
-        indices = []
+        # For each source, select random chunks to fill the target count
+        chunk_groups: list[tuple[int, int, int]] = []  # (start_idx, chunk_size, take)
+
         for name, ratio in self.dataset.source_ratios.items():
             ranges = self.dataset.source_ranges[name]
-            source_size = self.dataset._source_sizes.get(name, 0)
-            if not ranges or source_size == 0:
+            if not ranges:
                 continue
-            n_samples = int(self.epoch_size * ratio)
-            # Sample indices from ranges
-            sampled = []
-            for _ in range(n_samples):
-                # Pick a random range weighted by size, then a random index within it
-                start, end = rng.choice(ranges)
-                sampled.append(rng.randint(start, end - 1))
-            indices.extend(sampled)
+            n_target = int(self.epoch_size * ratio)
 
-        rng.shuffle(indices)
+            remaining = n_target
+            while remaining > 0:
+                shuffled = list(ranges)
+                rng.shuffle(shuffled)
+                for start, end in shuffled:
+                    if remaining <= 0:
+                        break
+                    chunk_size = end - start
+                    take = min(chunk_size, remaining)
+                    chunk_groups.append((start, chunk_size, take))
+                    remaining -= take
+
+        # Shuffle chunk order for inter-chunk randomness
+        rng.shuffle(chunk_groups)
+
+        # Yield indices: within each chunk, sample and shuffle
+        indices: list[int] = []
+        for start, chunk_size, take in chunk_groups:
+            if take >= chunk_size:
+                chunk_indices = list(range(start, start + chunk_size))
+            else:
+                chunk_indices = rng.sample(range(start, start + chunk_size), take)
+            rng.shuffle(chunk_indices)
+            indices.extend(chunk_indices)
+
         return iter(indices)
 
     def __len__(self) -> int:
