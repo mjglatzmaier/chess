@@ -84,17 +84,18 @@ class MixedChessDataset(Dataset):
 
             # Fast path: use metadata to avoid scanning every chunk
             meta_path = os.path.join(data_dir, "metadata.npz")
-            if os.path.exists(meta_path):
+            if os.path.exists(meta_path) and len(chunk_paths) > 0:
                 meta = np.load(meta_path)
                 total_positions = int(meta["total_positions"])
                 num_chunks = int(meta["num_chunks"])
-                chunk_size = int(meta["chunk_size"])
-                # All chunks are chunk_size except possibly the last
+                # Read first chunk to get actual chunk size (metadata may be wrong)
+                with np.load(str(chunk_paths[0])) as d:
+                    actual_chunk_size = len(d["values"])
                 for i, cpath in enumerate(chunk_paths[:num_chunks]):
                     if i < num_chunks - 1:
-                        sz = chunk_size
+                        sz = actual_chunk_size
                     else:
-                        sz = total_positions - chunk_size * (num_chunks - 1)
+                        sz = total_positions - actual_chunk_size * (num_chunks - 1)
                     start_idx = total
                     self.entries.append((name, str(cpath), start_idx, sz))
                     total += sz
