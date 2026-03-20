@@ -117,8 +117,18 @@ class MixedChessDataset(Dataset):
             for name, ranges in self.source_ranges.items()
         }
 
+        # Auto-size cache: keep all small chunks permanently cached to avoid
+        # repeated np.load/zlib decompress cycles (which can leak C resources).
+        # Margin of 50 accommodates large chunks per epoch without cascading
+        # evictions of small chunks.
+        small_threshold = 10_000  # chunks with < 10K positions are "small"
+        n_small = sum(1 for _, _, _, sz in self.entries if sz < small_threshold)
+        effective_cache_size = max(chunk_cache_size, n_small + 50)
+        self.chunk_cache_size = effective_cache_size
+
         # LRU chunk cache
         self._chunk_cache: OrderedDict[str, tuple] = OrderedDict()
+        self._chunk_load_count = 0  # diagnostic: total np.load calls
 
         # Print summary
         print(f"MixedChessDataset: {self.total_size:,} total positions")
@@ -126,6 +136,11 @@ class MixedChessDataset(Dataset):
             count = self._source_sizes.get(name, 0)
             ratio = self.source_ratios.get(name, 0)
             print(f"  {name}: {count:,} positions (target ratio: {ratio:.1%})")
+        if effective_cache_size > chunk_cache_size:
+            print(f"  Chunk cache auto-sized: {effective_cache_size} "
+                  f"(caching {n_small} small chunks permanently)")
+        else:
+            print(f"  Chunk cache size: {effective_cache_size}")
 
     def _load_chunk(self, chunk_path: str) -> tuple:
         """Load chunk with LRU caching. Arrays are copied to avoid dangling
@@ -146,7 +161,24 @@ class MixedChessDataset(Dataset):
                 data["weights"].copy() if "weights" in data else None,
             )
         self._chunk_cache[chunk_path] = entry
+        self._chunk_load_count += 1
         return entry
+
+    def cache_stats(self) -> dict:
+        """Return diagnostic info about chunk cache state."""
+        import resource
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        try:
+            n_fds = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+        except OSError:
+            n_fds = -1
+        return {
+            "cache_size": len(self._chunk_cache),
+            "cache_capacity": self.chunk_cache_size,
+            "total_loads": self._chunk_load_count,
+            "rss_mb": rss_mb,
+            "open_fds": n_fds,
+        }
 
     def _find_chunk(self, idx: int) -> tuple[str, str, int]:
         """Find chunk containing global index. Returns (source, chunk_path, local_idx)."""
@@ -164,6 +196,12 @@ class MixedChessDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         source, cpath, local = self._find_chunk(idx)
         boards, values, policies, sources_arr, weights_arr = self._load_chunk(cpath)
+
+        if local < 0 or local >= len(boards):
+            raise IndexError(
+                f"Bounds violation: idx={idx}, chunk={cpath}, local={local}, "
+                f"chunk_len={len(boards)}, source={source}"
+            )
 
         board = torch.from_numpy(boards[local].copy())
         value = torch.tensor(values[local])
@@ -224,15 +262,13 @@ class ProportionalSampler(Sampler):
         # Shuffle chunk order for inter-chunk randomness
         rng.shuffle(chunk_groups)
 
-        # Build indices with numpy for speed
-        arrays = []
+        # Yield indices chunk-by-chunk (generator) instead of materializing
+        # a full 5M-element Python list. Each chunk's indices are generated
+        # as a small numpy array and yielded immediately.
         for start, chunk_size, take in chunk_groups:
             arr = np_rng.choice(chunk_size, size=take, replace=False) + start
             np_rng.shuffle(arr)
-            arrays.append(arr)
-
-        indices = np.concatenate(arrays)
-        return iter(indices.tolist())
+            yield from arr.tolist()
 
     def __len__(self) -> int:
         return self.epoch_size

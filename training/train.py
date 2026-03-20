@@ -20,11 +20,28 @@ Usage:
 """
 
 import argparse
+import ctypes
+import faulthandler
+import gc
 import math
 import os
+import resource
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
+
+# Print Python traceback on segfault/bus error to stderr
+faulthandler.enable()
+
+# glibc's malloc_trim: force return of freed heap memory to the OS
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    def _malloc_trim():
+        _libc.malloc_trim(0)
+except OSError:
+    def _malloc_trim():
+        pass
 
 import numpy as np
 import torch
@@ -106,7 +123,8 @@ class ChessDataset(Dataset):
                   f"(policy: {'yes' if self.policies is not None else 'no'})")
 
     def _load_chunk(self, chunk_idx: int) -> tuple:
-        """Load a chunk into the LRU cache and return (boards, values, policies)."""
+        """Load a chunk into the LRU cache and return (boards, values, policies).
+        Arrays are copied to avoid dangling references to NpzFile buffers."""
         if chunk_idx in self._chunk_cache:
             # Move to end (most recently used)
             self._chunk_cache.move_to_end(chunk_idx)
@@ -116,12 +134,12 @@ class ChessDataset(Dataset):
         while len(self._chunk_cache) >= self.chunk_cache_size:
             self._chunk_cache.popitem(last=False)
 
-        data = np.load(self.chunk_paths[chunk_idx])
-        entry = (
-            data["boards"],
-            data["values"],
-            data["policies"] if "policies" in data else None,
-        )
+        with np.load(self.chunk_paths[chunk_idx]) as data:
+            entry = (
+                data["boards"].copy(),
+                data["values"].copy(),
+                data["policies"].copy() if "policies" in data else None,
+            )
         self._chunk_cache[chunk_idx] = entry
         return entry
 
@@ -153,6 +171,27 @@ class ChessDataset(Dataset):
         return board, value, policy
 
 
+def _log_diagnostics(label: str, device: torch.device, dataset=None):
+    """Print memory/resource diagnostics for crash investigation."""
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    try:
+        n_fds = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except OSError:
+        n_fds = -1
+    parts = [f"  [{label}] RSS: {rss_mb:.0f} MB, FDs: {n_fds}"]
+    if device.type == "cuda":
+        gpu_alloc = torch.cuda.memory_allocated() / 1e6
+        gpu_reserved = torch.cuda.memory_reserved() / 1e6
+        parts.append(f"GPU: {gpu_alloc:.0f}/{gpu_reserved:.0f} MB (alloc/reserved)")
+    if dataset is not None and hasattr(dataset, 'cache_stats'):
+        cs = dataset.cache_stats()
+        parts.append(
+            f"cache: {cs['cache_size']}/{cs['cache_capacity']} chunks, "
+            f"{cs['total_loads']} loads"
+        )
+    print(", ".join(parts), flush=True)
+
+
 def train(
     model: ChessTransformer,
     train_loader: DataLoader,
@@ -162,12 +201,14 @@ def train(
     log_dir: str | None = None,
     val_loader: DataLoader | None = None,
     sampler=None,
+    dataset=None,
 ) -> None:
     """Main training loop with warmup, validation, and per-loss tracking.
 
     Args:
         sampler: Optional ProportionalSampler; if provided, set_epoch() is
                  called each epoch for reproducible shuffling.
+        dataset: Optional dataset for diagnostic cache stats.
     """
 
     optimizer = torch.optim.AdamW(
@@ -198,6 +239,11 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(config.epochs):
+        # Force garbage collection and return freed memory to OS
+        gc.collect()
+        _malloc_trim()
+        _log_diagnostics(f"epoch {epoch+1} start", device, dataset)
+
         if sampler is not None:
             sampler.set_epoch(epoch)
         epoch_loss = 0.0
@@ -259,8 +305,10 @@ def train(
             f"policy: {avg_policy_loss:.4f} | "
             f"lr: {scheduler.get_last_lr()[0]:.2e} | "
             f"{samples_per_sec:.0f} pos/s | "
-            f"{elapsed:.1f}s"
+            f"{elapsed:.1f}s",
+            flush=True,
         )
+        _log_diagnostics(f"epoch {epoch+1} end", device, dataset)
 
         if writer:
             writer.add_scalar("epoch/loss", avg_loss, epoch)
@@ -474,7 +522,8 @@ def main():
 
     # Train
     train(model, train_loader, train_config, args.output, device,
-          args.log_dir, val_loader, sampler=sampler)
+          args.log_dir, val_loader, sampler=sampler,
+          dataset=dataset if use_mixed else None)
 
 
 if __name__ == "__main__":
