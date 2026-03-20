@@ -10,24 +10,36 @@ predict the move a strong engine would play.
 
 Supports checkpointing — re-run the same command to resume an interrupted run.
 
+Uses pgn-extract (C tool) for PGN parsing instead of python-chess's chess.pgn,
+which suffers from unbounded memory growth on large files due to GameNode tree
+construction with circular references.
+
 Usage:
     python prepare_data.py games.pgn --output data/round_0/
     python prepare_data.py games.pgn --output data/round_0/ --max-games 250000
+
+Requires:
+    pgn-extract (apt install pgn-extract)
 """
 
 import argparse
 import gc
 import json
 import os
+import re
+import shutil
+import subprocess
 
 import chess
-import chess.pgn
 import numpy as np
 from tqdm import tqdm
 
 from encoding import board_to_tensor, move_to_index, NUM_FEATURES, NUM_GLOBAL_FEATURES
 
 CHECKPOINT_FILE = "checkpoint.json"
+
+RESULT_VALUES = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}
+HEADER_RE = re.compile(r'^\[(\w+)\s+"(.*)"\]$')
 
 
 def _load_checkpoint(output_dir: str) -> dict | None:
@@ -44,6 +56,34 @@ def _save_checkpoint(output_dir: str, state: dict) -> None:
     with open(tmp, "w") as f:
         json.dump(state, f)
     os.replace(tmp, path)
+
+
+def _iter_uci_games(stream):
+    """
+    Yield (headers_dict, uci_moves_list) for each game from pgn-extract
+    UCI-format output.  Parsing is plain string ops — no chess library needed.
+    """
+    headers = {}
+    for line in stream:
+        line = line.rstrip("\n\r")
+
+        m = HEADER_RE.match(line)
+        if m:
+            headers[m.group(1)] = m.group(2)
+            continue
+
+        # Blank or whitespace-only lines between header block and moves
+        if not line.strip():
+            continue
+
+        # Moves line: "d2d4 g8f6 ... 1-0"
+        tokens = line.split()
+        # Strip result token from end (1-0, 0-1, 1/2-1/2, *)
+        if tokens and tokens[-1] in ("1-0", "0-1", "1/2-1/2", "*"):
+            tokens.pop()
+
+        yield headers, tokens
+        headers = {}
 
 
 def process_pgn(
@@ -63,8 +103,18 @@ def process_pgn(
       - value: float in [-1, +1] (game outcome from side-to-move perspective)
       - policy: int in [0, 4095] (index of move actually played)
 
+    PGN parsing is delegated to pgn-extract (C tool) which streams clean
+    UCI-format output.  python-chess is used only for board state tracking
+    and feature encoding — no GameNode trees, no memory accumulation.
+
     Checkpoints after each chunk so interrupted runs can be resumed.
     """
+    pgn_extract = shutil.which("pgn-extract")
+    if pgn_extract is None:
+        raise RuntimeError(
+            "pgn-extract not found.  Install it with:  sudo apt install pgn-extract"
+        )
+
     os.makedirs(output_dir, exist_ok=True)
 
     num_features = NUM_FEATURES + NUM_GLOBAL_FEATURES
@@ -74,7 +124,7 @@ def process_pgn(
         total_positions = ckpt["total_positions"]
         skipped_games = ckpt["skipped_games"]
         chunk_idx = ckpt["chunk_idx"]
-        file_offset = ckpt["file_offset"]
+        resume_games = total_games
         print(f"Resuming from checkpoint: {total_games:,} games, "
               f"{total_positions:,} positions, chunk {chunk_idx}")
     else:
@@ -82,7 +132,7 @@ def process_pgn(
         total_positions = 0
         skipped_games = 0
         chunk_idx = 0
-        file_offset = 0
+        resume_games = 0
 
     # Pre-allocate chunk buffers (reused across chunks)
     boards_buf = np.zeros((chunk_size, 65, num_features), dtype=np.float32)
@@ -92,90 +142,102 @@ def process_pgn(
     weights_buf = np.ones(chunk_size, dtype=np.float32)
     buf_idx = 0
 
-    pgn_file = open(pgn_path, errors="replace")
-    if file_offset > 0:
-        pgn_file.seek(file_offset)
+    # Pipe PGN through pgn-extract for robust C-based parsing.
+    # -Wuci: output moves in UCI notation (e2e4 not e4)
+    # -s: silent (no per-game status on stderr)
+    # -C: strip comments  -N: strip NAGs  -V: strip variations
+    # -w10000: wide lines so each game's moves fit on one line
+    proc = subprocess.Popen(
+        [pgn_extract, "-Wuci", "-s", "-C", "-N", "-V", "-w10000", pgn_path],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, errors="replace", bufsize=1,
+    )
 
-    target = f"/{max_games:,}" if max_games > 0 else ""
     pbar = tqdm(
         desc="Games", unit=" games", initial=total_games,
         total=max_games if max_games > 0 else None, miniters=500,
     )
 
-    while True:
-        game_offset = pgn_file.tell()
-        game = chess.pgn.read_game(pgn_file)
-        if game is None:
-            break
+    # On resume, fast-skip already-processed games.
+    # pgn-extract re-parses in C so this is ~100× faster than python-chess.
+    games_seen = 0
 
-        result_str = game.headers.get("Result", "*")
-        if result_str == "1-0":
-            result = 1.0
-        elif result_str == "0-1":
-            result = 0.0
-        elif result_str == "1/2-1/2":
-            result = 0.5
-        else:
-            skipped_games += 1
-            continue
+    try:
+        for headers, uci_moves in _iter_uci_games(proc.stdout):
+            # Fast-skip on resume
+            if games_seen < resume_games:
+                games_seen += 1
+                continue
+            games_seen += 1
 
-        try:
-            w_elo = int(game.headers.get("WhiteElo", "0") or "0")
-            b_elo = int(game.headers.get("BlackElo", "0") or "0")
-        except ValueError:
-            w_elo = b_elo = 0
+            result_str = headers.get("Result", "*")
+            result = RESULT_VALUES.get(result_str)
+            if result is None:
+                skipped_games += 1
+                continue
 
-        if min_elo > 0 and (w_elo < min_elo or b_elo < min_elo):
-            skipped_games += 1
-            continue
-        if max_elo < 99999 and (w_elo > max_elo or b_elo > max_elo):
-            skipped_games += 1
-            continue
+            try:
+                w_elo = int(headers.get("WhiteElo", "0") or "0")
+                b_elo = int(headers.get("BlackElo", "0") or "0")
+            except ValueError:
+                w_elo = b_elo = 0
 
-        board = game.board()
-        move_num = 0
+            if min_elo > 0 and (w_elo < min_elo or b_elo < min_elo):
+                skipped_games += 1
+                continue
+            if max_elo < 99999 and (w_elo > max_elo or b_elo > max_elo):
+                skipped_games += 1
+                continue
 
-        for move in game.mainline_moves():
-            move_num += 1
+            board = chess.Board()
+            move_num = 0
 
-            if move_num > skip_moves and not board.is_check():
-                boards_buf[buf_idx] = board_to_tensor(board)
+            for uci_str in uci_moves:
+                move_num += 1
+                # pgn-extract uses uppercase for promotions (e7e8Q);
+                # python-chess expects lowercase
+                move = chess.Move.from_uci(uci_str.lower())
 
-                if board.turn == chess.WHITE:
-                    values_buf[buf_idx] = 2.0 * result - 1.0
-                else:
-                    values_buf[buf_idx] = 2.0 * (1.0 - result) - 1.0
+                if move_num > skip_moves and not board.is_check():
+                    boards_buf[buf_idx] = board_to_tensor(board)
 
-                policy_buf[buf_idx] = move_to_index(move)
-                buf_idx += 1
-                total_positions += 1
+                    if board.turn == chess.WHITE:
+                        values_buf[buf_idx] = 2.0 * result - 1.0
+                    else:
+                        values_buf[buf_idx] = 2.0 * (1.0 - result) - 1.0
 
-            board.push(move)
+                    policy_buf[buf_idx] = move_to_index(move)
+                    buf_idx += 1
+                    total_positions += 1
 
-            if buf_idx >= chunk_size:
-                _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
-                            policy_buf, sources_buf, weights_buf, buf_idx)
-                chunk_idx += 1
-                buf_idx = 0
+                board.push(move)
 
-                _save_checkpoint(output_dir, {
-                    "total_games": total_games,
-                    "total_positions": total_positions,
-                    "skipped_games": skipped_games,
-                    "chunk_idx": chunk_idx,
-                    "file_offset": game_offset,
-                })
-                gc.collect()
+                if buf_idx >= chunk_size:
+                    _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,
+                                policy_buf, sources_buf, weights_buf, buf_idx)
+                    chunk_idx += 1
+                    buf_idx = 0
 
-        total_games += 1
-        pbar.update(1)
-        pbar.set_postfix(pos=f"{total_positions:,}", chunks=chunk_idx)
+                    _save_checkpoint(output_dir, {
+                        "total_games": total_games,
+                        "total_positions": total_positions,
+                        "skipped_games": skipped_games,
+                        "chunk_idx": chunk_idx,
+                    })
+                    gc.collect()
 
-        if max_games > 0 and total_games >= max_games:
-            break
+            total_games += 1
+            pbar.update(1)
+            pbar.set_postfix(pos=f"{total_positions:,}", chunks=chunk_idx)
+
+            if max_games > 0 and total_games >= max_games:
+                break
+    finally:
+        proc.stdout.close()
+        proc.terminate()
+        proc.wait()
 
     pbar.close()
-    pgn_file.close()
 
     if buf_idx > 0:
         _save_chunk(output_dir, chunk_idx, boards_buf, values_buf,

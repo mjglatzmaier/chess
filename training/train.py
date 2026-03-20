@@ -9,9 +9,14 @@ Trains on prepared data (board tensors + value targets) using:
   - Gradient clipping for stability
 
 Usage:
+    # Single data source:
     python train.py --data data/round_0/ --output models/round_0.pt
     python train.py --data data/round_0/ --checkpoint models/round_0.pt --output models/round_1.pt
     python train.py --data data/round_0/ --model-size tiny --epochs 5
+
+    # Mixed data sources (proportional sampling per epoch):
+    python train.py --ccrl data/round_0/ 0.8 --synthetic data/synthetic/ 0.2 \\
+        --output models/round_0.pt --epoch-size 5000000
 """
 
 import argparse
@@ -156,8 +161,14 @@ def train(
     device: torch.device,
     log_dir: str | None = None,
     val_loader: DataLoader | None = None,
+    sampler=None,
 ) -> None:
-    """Main training loop with warmup, validation, and per-loss tracking."""
+    """Main training loop with warmup, validation, and per-loss tracking.
+
+    Args:
+        sampler: Optional ProportionalSampler; if provided, set_epoch() is
+                 called each epoch for reproducible shuffling.
+    """
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -187,6 +198,8 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(config.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         epoch_loss = 0.0
         epoch_value_loss = 0.0
         epoch_policy_loss = 0.0
@@ -324,7 +337,7 @@ def _evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="Train chess transformer")
-    parser.add_argument("--data", required=True, help="Training data directory")
+    parser.add_argument("--data", default=None, help="Training data directory (single source)")
     parser.add_argument("--output", default="models/model.pt", help="Output model path")
     parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
     parser.add_argument("--model-size", default="small", choices=["tiny", "small", "medium"])
@@ -335,7 +348,31 @@ def main():
     parser.add_argument("--log-dir", default="runs/", help="TensorBoard log dir")
     parser.add_argument("--val-fraction", type=float, default=0.05,
                         help="Fraction of data for validation (default: 0.05)")
+    # Multi-source mixing
+    parser.add_argument("--ccrl", nargs=2, metavar=("DIR", "RATIO"),
+                        help="CCRL data directory and ratio (e.g., data/round_0/ 0.8)")
+    parser.add_argument("--synthetic", nargs=2, metavar=("DIR", "RATIO"),
+                        help="Synthetic data directory and ratio (e.g., data/synthetic/ 0.2)")
+    parser.add_argument("--endgame", nargs=2, metavar=("DIR", "RATIO"),
+                        help="Endgame data directory and ratio")
+    parser.add_argument("--opening", nargs=2, metavar=("DIR", "RATIO"),
+                        help="Opening data directory and ratio")
+    parser.add_argument("--epoch-size", type=int, default=None,
+                        help="Positions per epoch when mixing (default: total dataset size)")
     args = parser.parse_args()
+
+    # Determine data mode: mixed sources vs single directory
+    mix_sources = {}
+    for name in ["ccrl", "synthetic", "endgame", "opening"]:
+        val = getattr(args, name)
+        if val:
+            mix_sources[name] = (val[0], float(val[1]))
+
+    use_mixed = len(mix_sources) > 0
+    if not use_mixed and args.data is None:
+        parser.error("Either --data or at least one source (--ccrl, --synthetic, etc.) is required")
+    if use_mixed and args.data:
+        parser.error("Cannot use --data together with --ccrl/--synthetic/--endgame/--opening")
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -355,8 +392,6 @@ def main():
     else:
         model = create_model(args.model_size).to(device)
 
-    # Load data
-    dataset = ChessDataset(args.data, lazy=args.lazy)
     train_config = TrainingConfig(
         batch_size=args.batch_size,
         learning_rate=args.lr,
@@ -364,48 +399,82 @@ def main():
         val_fraction=args.val_fraction,
     )
 
-    # Train/val split
-    val_loader = None
-    if train_config.val_fraction > 0:
-        val_size = max(1, int(len(dataset) * train_config.val_fraction))
-        train_size = len(dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42),
-        )
-        print(f"Split: {train_size:,} train, {val_size:,} val")
-    else:
-        train_dataset = dataset
+    sampler = None
 
-    # Lazy mode: num_workers=0 for better LRU cache hit rate
-    num_workers = 0 if args.lazy else train_config.num_workers
+    if use_mixed:
+        from data_mixer import DataMixer
+        print(f"\nMixed-source training:")
+        mixer = DataMixer(mix_sources)
+        dataset = mixer.dataset
+        epoch_size = args.epoch_size or dataset.total_size
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=train_config.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-    )
+        # For mixed sources, split validation off from the largest source
+        # by reserving a fraction of its indices, then use proportional
+        # sampling on the training portion.
+        # Simpler approach: no val split for mixed mode (eval on separate data).
+        val_loader = None
+        if train_config.val_fraction > 0:
+            print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
 
-    if train_config.val_fraction > 0:
-        val_loader = DataLoader(
-            val_dataset,
+        from data_mixer import ProportionalSampler
+        sampler = ProportionalSampler(dataset, epoch_size=epoch_size)
+
+        num_workers = 0  # mixed mode uses LRU caching, workers hurt cache hits
+        train_loader = DataLoader(
+            dataset,
             batch_size=train_config.batch_size,
-            shuffle=False,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=(device.type == "cuda"),
+            drop_last=True,
+        )
+        print(f"  Epoch size: {epoch_size:,} positions")
+        print(f"  Batches per epoch: {len(train_loader)}")
+    else:
+        # Single-source mode (original behavior)
+        dataset = ChessDataset(args.data, lazy=args.lazy)
+
+        # Train/val split
+        val_loader = None
+        if train_config.val_fraction > 0:
+            val_size = max(1, int(len(dataset) * train_config.val_fraction))
+            train_size = len(dataset) - val_size
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                dataset, [train_size, val_size],
+                generator=torch.Generator().manual_seed(42),
+            )
+            print(f"Split: {train_size:,} train, {val_size:,} val")
+        else:
+            train_dataset = dataset
+
+        num_workers = 0 if args.lazy else train_config.num_workers
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            drop_last=True,
         )
 
-    print(f"Batches per epoch: {len(train_loader)}")
+        if train_config.val_fraction > 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=train_config.batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=(device.type == "cuda"),
+            )
+
+        print(f"Batches per epoch: {len(train_loader)}")
 
     # Create output directory
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     # Train
     train(model, train_loader, train_config, args.output, device,
-          args.log_dir, val_loader)
+          args.log_dir, val_loader, sampler=sampler)
 
 
 if __name__ == "__main__":

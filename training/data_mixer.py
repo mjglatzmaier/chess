@@ -258,51 +258,165 @@ def merge_to_chunks(
     """
     Merge multiple source directories into a single output directory
     with proportional sampling pre-applied. Useful for offline preparation.
+
+    Works chunk-by-chunk for efficiency: loads each input chunk once,
+    takes all (or a random subsample of) its positions, and streams
+    into output chunks.
     """
     os.makedirs(output_dir, exist_ok=True)
-
-    dataset = MixedChessDataset(sources)
-    sampler = ProportionalSampler(dataset)
-    indices = list(sampler)
-
-    boards_buf, values_buf, policy_buf = [], [], []
-    sources_buf, weights_buf = [], []
-    chunk_idx = 0
-    total = 0
-
-    print(f"Merging {len(indices):,} positions into {output_dir}/")
     from tqdm import tqdm
 
-    for idx in tqdm(indices, desc="Merging"):
-        source, cpath, local = dataset._find_chunk(idx)
-        boards, values, policies, src_arr, wt_arr = dataset._load_chunk(cpath)
+    # Normalize ratios
+    total_ratio = sum(r for _, r in sources.values())
+    ratios = {name: r / total_ratio for name, (_, r) in sources.items()}
 
-        boards_buf.append(boards[local])
-        values_buf.append(values[local])
-        pol = policies[local] if policies is not None else 0
-        policy_buf.append(pol)
-        sources_buf.append(SOURCE_IDS.get(source, 0))
-        weights_buf.append(wt_arr[local] if wt_arr is not None else 1.0)
-        total += 1
+    # Discover chunks and sizes per source
+    source_chunks: dict[str, list[tuple[str, int]]] = {}
+    source_totals: dict[str, int] = {}
+    for name, (data_dir, _) in sources.items():
+        chunks = []
+        total = 0
+        for cpath in sorted(Path(data_dir).glob("chunk_*.npz")):
+            with np.load(str(cpath)) as data:
+                sz = len(data["values"])
+            chunks.append((str(cpath), sz))
+            total += sz
+        source_chunks[name] = chunks
+        source_totals[name] = total
+        print(f"  {name}: {total:,} positions in {len(chunks)} chunks")
 
-        if len(boards_buf) >= chunk_size:
-            _save_mixed_chunk(
+    # Determine how many positions to take from each source.
+    # Use the largest source to anchor, then scale others to match ratios.
+    # E.g., 80/20 with 271M ccrl → take all 271M ccrl + 67.8M synthetic
+    # But if synthetic only has 552K, oversample it to 67.8M.
+    # To keep output size reasonable, cap at the largest source's full size
+    # divided by its ratio.
+    anchor_name = max(source_totals, key=source_totals.get)
+    anchor_total = source_totals[anchor_name]
+    anchor_ratio = ratios[anchor_name]
+    dataset_size = int(anchor_total / anchor_ratio)
+
+    target_counts = {name: int(dataset_size * ratios[name]) for name in sources}
+    print(f"\nTarget mix ({dataset_size:,} total):")
+    for name, count in target_counts.items():
+        avail = source_totals[name]
+        repeats = count / avail if avail > 0 else 0
+        print(f"  {name}: {count:,} positions ({ratios[name]:.0%})"
+              f" — {repeats:.1f}x of available {avail:,}")
+
+    # Build the work list: (chunk_path, source_name, sample_fraction)
+    # For sources needing oversampling, repeat chunks multiple times.
+    rng = np.random.default_rng(42)
+    work: list[tuple[str, str, float]] = []
+
+    for name in sources:
+        chunks = source_chunks[name]
+        avail = source_totals[name]
+        target = target_counts[name]
+        if avail == 0:
+            continue
+
+        if target <= avail:
+            # Subsample: take fraction of each chunk
+            frac = target / avail
+            for cpath, sz in chunks:
+                work.append((cpath, name, frac))
+        else:
+            # Oversample: full passes + a fractional remainder pass
+            full_passes = target // avail
+            remainder_frac = (target % avail) / avail
+            for _ in range(full_passes):
+                for cpath, sz in chunks:
+                    work.append((cpath, name, 1.0))
+            if remainder_frac > 0:
+                for cpath, sz in chunks:
+                    work.append((cpath, name, remainder_frac))
+
+    # Shuffle work order for good mixing
+    rng.shuffle(work)
+
+    # Process chunks and stream into output
+    boards_buf = []
+    values_buf = []
+    policy_buf = []
+    sources_buf = []
+    weights_buf = []
+    buf_len = 0
+    chunk_idx = 0
+    total_written = 0
+
+    for cpath, name, frac in tqdm(work, desc="Merging chunks"):
+        data = np.load(cpath)
+        n = len(data["values"])
+        src_id = SOURCE_IDS.get(name, 0)
+
+        if frac >= 1.0:
+            sel = np.arange(n)
+        else:
+            k = max(1, int(n * frac))
+            sel = rng.choice(n, size=k, replace=False)
+            sel.sort()
+
+        boards_buf.append(data["boards"][sel])
+        values_buf.append(data["values"][sel])
+        if "policies" in data:
+            policy_buf.append(data["policies"][sel])
+        else:
+            policy_buf.append(np.zeros(len(sel), dtype=np.int64))
+        sources_buf.append(np.full(len(sel), src_id, dtype=np.uint8))
+        if "weights" in data:
+            weights_buf.append(data["weights"][sel])
+        else:
+            weights_buf.append(np.ones(len(sel), dtype=np.float32))
+        buf_len += len(sel)
+
+        # Flush when buffer exceeds chunk_size
+        while buf_len >= chunk_size:
+            b = np.concatenate(boards_buf)
+            v = np.concatenate(values_buf)
+            p = np.concatenate(policy_buf)
+            s = np.concatenate(sources_buf)
+            w = np.concatenate(weights_buf)
+
+            # Shuffle within the output chunk
+            perm = rng.permutation(len(b))
+            b, v, p, s, w = b[perm], v[perm], p[perm], s[perm], w[perm]
+
+            # Write chunk_size positions, keep remainder
+            _save_mixed_chunk_arrays(
                 output_dir, chunk_idx,
-                boards_buf, values_buf, policy_buf, sources_buf, weights_buf,
+                b[:chunk_size], v[:chunk_size], p[:chunk_size],
+                s[:chunk_size], w[:chunk_size],
             )
             chunk_idx += 1
-            boards_buf, values_buf, policy_buf = [], [], []
-            sources_buf, weights_buf = [], []
+            total_written += chunk_size
 
-    if boards_buf:
-        _save_mixed_chunk(
+            # Keep leftovers
+            b, v, p, s, w = b[chunk_size:], v[chunk_size:], p[chunk_size:], s[chunk_size:], w[chunk_size:]
+            boards_buf = [b] if len(b) > 0 else []
+            values_buf = [v] if len(v) > 0 else []
+            policy_buf = [p] if len(p) > 0 else []
+            sources_buf = [s] if len(s) > 0 else []
+            weights_buf = [w] if len(w) > 0 else []
+            buf_len = len(b)
+
+    # Final partial chunk
+    if buf_len > 0:
+        b = np.concatenate(boards_buf)
+        v = np.concatenate(values_buf)
+        p = np.concatenate(policy_buf)
+        s = np.concatenate(sources_buf)
+        w = np.concatenate(weights_buf)
+        perm = rng.permutation(len(b))
+        _save_mixed_chunk_arrays(
             output_dir, chunk_idx,
-            boards_buf, values_buf, policy_buf, sources_buf, weights_buf,
+            b[perm], v[perm], p[perm], s[perm], w[perm],
         )
         chunk_idx += 1
+        total_written += len(b)
 
     metadata = {
-        "total_positions": total,
+        "total_positions": total_written,
         "total_games": 0,
         "skipped_games": 0,
         "num_chunks": chunk_idx,
@@ -313,7 +427,7 @@ def merge_to_chunks(
         "has_policy": True,
     }
     np.savez(os.path.join(output_dir, "metadata.npz"), **metadata)
-    print(f"\nDone: {total:,} positions in {chunk_idx} chunks → {output_dir}/")
+    print(f"\nDone: {total_written:,} positions in {chunk_idx} chunks → {output_dir}/")
 
 
 def _save_mixed_chunk(
@@ -333,6 +447,27 @@ def _save_mixed_chunk(
         policies=np.array(policies, dtype=np.int64),
         sources=np.array(sources, dtype=np.uint8),
         weights=np.array(weights, dtype=np.float32),
+    )
+
+
+def _save_mixed_chunk_arrays(
+    output_dir: str,
+    chunk_idx: int,
+    boards: np.ndarray,
+    values: np.ndarray,
+    policies: np.ndarray,
+    sources: np.ndarray,
+    weights: np.ndarray,
+) -> None:
+    """Save pre-assembled numpy arrays directly (no stacking needed)."""
+    path = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.npz")
+    np.savez_compressed(
+        path,
+        boards=boards,
+        values=values.astype(np.float32),
+        policies=policies.astype(np.int64),
+        sources=sources.astype(np.uint8),
+        weights=weights.astype(np.float32),
     )
 
 
