@@ -128,7 +128,8 @@ class MixedChessDataset(Dataset):
             print(f"  {name}: {count:,} positions (target ratio: {ratio:.1%})")
 
     def _load_chunk(self, chunk_path: str) -> tuple:
-        """Load chunk with LRU caching."""
+        """Load chunk with LRU caching. Arrays are copied to avoid dangling
+        references to the NpzFile's memory-mapped buffers after eviction."""
         if chunk_path in self._chunk_cache:
             self._chunk_cache.move_to_end(chunk_path)
             return self._chunk_cache[chunk_path]
@@ -136,14 +137,14 @@ class MixedChessDataset(Dataset):
         while len(self._chunk_cache) >= self.chunk_cache_size:
             self._chunk_cache.popitem(last=False)
 
-        data = np.load(chunk_path)
-        entry = (
-            data["boards"],
-            data["values"],
-            data["policies"] if "policies" in data else None,
-            data["sources"] if "sources" in data else None,
-            data["weights"] if "weights" in data else None,
-        )
+        with np.load(chunk_path) as data:
+            entry = (
+                data["boards"].copy(),
+                data["values"].copy(),
+                data["policies"].copy() if "policies" in data else None,
+                data["sources"].copy() if "sources" in data else None,
+                data["weights"].copy() if "weights" in data else None,
+            )
         self._chunk_cache[chunk_path] = entry
         return entry
 
