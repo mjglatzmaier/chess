@@ -471,10 +471,10 @@ class HDF5EpochDataset(Dataset):
     """
     Preloads one epoch of HDF5 data into RAM as a standard map-style Dataset.
 
-    Completely separates HDF5 I/O from GPU training: load_epoch() reads all
-    needed chunks upfront into contiguous numpy arrays, then __getitem__
-    operates purely on in-memory data with no h5py calls. This avoids any
-    interaction between HDF5's C library and CUDA's runtime during training.
+    Completely separates HDF5 I/O from GPU training: load_epoch() opens the
+    HDF5 files, reads all needed chunks, and closes them before returning.
+    During training, __getitem__ operates purely on in-memory numpy arrays
+    with zero HDF5 C library involvement in the process.
 
     Memory: epoch_size × 1,755 bytes (uint8 boards) ≈ 8.8 GB for 5M positions.
     """
@@ -504,35 +504,33 @@ class HDF5EpochDataset(Dataset):
             if total_ratio > 0 else raw_ratios
         )
 
-        # Open HDF5 files and discover chunk layout
-        self._files: dict[str, h5py.File] = {}
+        # Store paths — files are opened transiently in load_epoch only
+        self._source_paths: dict[str, str] = {
+            name: path for name, (path, _) in sources.items()
+        }
+
+        # Probe files once to discover layout, then close immediately
         self._source_meta: dict[str, dict] = {}
         self.total_positions = 0
+        self._board_dtype = np.float32
 
-        for name, (path, _) in sources.items():
+        for name, path in self._source_paths.items():
             if not os.path.exists(path):
                 print(f"Warning: source '{name}' file not found: {path}")
                 continue
 
-            f = h5py.File(path, "r")
-            self._files[name] = f
-
-            n = int(f.attrs["total_positions"])
-            cs = f["boards"].chunks[0]
-            self._source_meta[name] = {
-                "n_positions": n,
-                "chunk_size": cs,
-                "n_chunks": math.ceil(n / cs),
-            }
-            self.total_positions += n
+            with h5py.File(path, "r") as f:
+                n = int(f.attrs["total_positions"])
+                cs = f["boards"].chunks[0]
+                self._board_dtype = f["boards"].dtype
+                self._source_meta[name] = {
+                    "n_positions": n,
+                    "chunk_size": cs,
+                    "n_chunks": math.ceil(n / cs),
+                }
+                self.total_positions += n
 
         self.epoch_size = epoch_size or self.total_positions
-
-        # Detect board encoding
-        self._board_dtype = np.float32
-        for name in self._files:
-            self._board_dtype = self._files[name]["boards"].dtype
-            break
 
         # In-memory epoch data (populated by load_epoch)
         self._boards: np.ndarray | None = None
@@ -542,7 +540,7 @@ class HDF5EpochDataset(Dataset):
 
         # Summary
         print(f"HDF5EpochDataset: {self.total_positions:,} total positions")
-        for name in self._files:
+        for name in self._source_meta:
             meta = self._source_meta[name]
             ratio = self.source_ratios.get(name, 0)
             print(f"  {name}: {meta['n_positions']:,} positions, "
@@ -554,8 +552,8 @@ class HDF5EpochDataset(Dataset):
     def load_epoch(self, epoch: int) -> None:
         """Read proportional chunks from HDF5 into RAM for this epoch.
 
-        After this call, __getitem__ operates purely on in-memory numpy
-        arrays — no h5py interaction during training.
+        Opens HDF5 files, reads the needed chunks, and closes them before
+        returning. No HDF5 file handles remain open during training.
         """
         # Free previous epoch's data before allocating new
         self._boards = None
@@ -574,7 +572,7 @@ class HDF5EpochDataset(Dataset):
             if name not in self._source_meta:
                 continue
             meta = self._source_meta[name]
-            f = self._files[name]
+            path = self._source_paths[name]
 
             n_target = int(self.epoch_size * ratio)
             n_chunks = min(
@@ -591,12 +589,14 @@ class HDF5EpochDataset(Dataset):
 
             chunk_indices.sort()  # Sequential disk reads
 
-            for ci in chunk_indices:
-                start = int(ci) * meta["chunk_size"]
-                end = min(start + meta["chunk_size"], meta["n_positions"])
-                all_boards.append(f["boards"][start:end])
-                all_values.append(f["values"][start:end])
-                all_policies.append(f["policies"][start:end])
+            # Open, read, close — h5py only alive during this block
+            with h5py.File(path, "r") as f:
+                for ci in chunk_indices:
+                    start = int(ci) * meta["chunk_size"]
+                    end = min(start + meta["chunk_size"], meta["n_positions"])
+                    all_boards.append(f["boards"][start:end])
+                    all_values.append(f["values"][start:end])
+                    all_policies.append(f["policies"][start:end])
 
         boards = np.concatenate(all_boards)
         values = np.concatenate(all_values)
@@ -629,7 +629,7 @@ class HDF5EpochDataset(Dataset):
 
         elapsed = time.time() - t0
         print(f"  Loaded {self._size:,} positions from HDF5 in {elapsed:.1f}s "
-              f"(epoch {epoch})")
+              f"(epoch {epoch})", flush=True)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         board_raw = self._boards[idx]  # uint8 [65, 27]
@@ -648,12 +648,3 @@ class HDF5EpochDataset(Dataset):
 
     def __len__(self) -> int:
         return self._size
-
-    def close(self):
-        """Close all HDF5 file handles."""
-        for f in self._files.values():
-            f.close()
-        self._files.clear()
-
-    def __del__(self):
-        self.close()

@@ -18,6 +18,7 @@
 #misc
 *.tar
 *.tar.gz
+*.7z
 *.pyc
 *.epd
 *.pt
@@ -25,6 +26,7 @@
 #directories
 x64/*
 log/*
+runs/*
 packages/*
 .vs/*
 build/*
