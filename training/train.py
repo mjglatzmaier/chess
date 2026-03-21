@@ -218,7 +218,12 @@ def train(
     )
 
     # Linear warmup then cosine decay
-    total_steps = len(train_loader) * config.epochs
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:
+        # IterableDataset — compute from dataset length
+        steps_per_epoch = len(dataset) // config.batch_size
+    total_steps = steps_per_epoch * config.epochs
 
     def lr_lambda(step: int) -> float:
         if step < config.warmup_steps:
@@ -242,10 +247,15 @@ def train(
         # Force garbage collection and return freed memory to OS
         gc.collect()
         _malloc_trim()
-        _log_diagnostics(f"epoch {epoch+1} start", device, dataset)
 
-        if sampler is not None:
+        if dataset is not None and hasattr(dataset, 'load_epoch'):
+            dataset.load_epoch(epoch)
+        elif sampler is not None:
             sampler.set_epoch(epoch)
+        elif dataset is not None and hasattr(dataset, 'set_epoch'):
+            dataset.set_epoch(epoch)
+
+        _log_diagnostics(f"epoch {epoch+1} start", device, dataset)
         epoch_loss = 0.0
         epoch_value_loss = 0.0
         epoch_policy_loss = 0.0
@@ -456,28 +466,27 @@ def main():
         )
 
         if use_hdf5:
-            from hdf5_dataset import HDF5ChessDataset, HDF5ProportionalSampler
+            from hdf5_dataset import HDF5EpochDataset
             print(f"\nMixed-source training (HDF5):")
-            dataset = HDF5ChessDataset(mix_sources)
-            epoch_size = args.epoch_size or dataset.total_size
+            epoch_size = args.epoch_size  # None → uses total dataset size
+            dataset = HDF5EpochDataset(
+                mix_sources, epoch_size=epoch_size,
+            )
 
             val_loader = None
             if train_config.val_fraction > 0:
                 print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
 
-            sampler = HDF5ProportionalSampler(dataset, epoch_size=epoch_size)
-
             num_workers = 0
             train_loader = DataLoader(
                 dataset,
                 batch_size=train_config.batch_size,
-                sampler=sampler,
+                shuffle=True,
                 num_workers=num_workers,
                 pin_memory=(device.type == "cuda"),
                 drop_last=True,
             )
-            print(f"  Epoch size: {epoch_size:,} positions")
-            print(f"  Batches per epoch: {len(train_loader)}")
+            print(f"  Batches per epoch: {len(dataset) // train_config.batch_size}")
         else:
             from data_mixer import DataMixer, ProportionalSampler
             print(f"\nMixed-source training (npz):")
