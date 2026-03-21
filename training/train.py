@@ -1,51 +1,32 @@
 """
-Training loop for the chess transformer.
+Training loop for the chess transformer (v2 — simplified, seg-fault-free).
 
-Trains on prepared data (board tensors + value targets) using:
-  - AdamW optimizer with cosine learning rate schedule
-  - Mixed precision training (fp16) for GPU efficiency
-  - TensorBoard logging
-  - Periodic checkpointing
-  - Gradient clipping for stability
+Trains on HDF5 data with all positions preloaded into RAM as torch tensors
+before training begins. No HDF5 file handles remain open during training,
+no shared numpy/torch memory, no ctypes hacks.
 
 Usage:
-    # Single data source:
-    python train.py --data data/round_0/ --output models/round_0.pt
-    python train.py --data data/round_0/ --checkpoint models/round_0.pt --output models/round_1.pt
-    python train.py --data data/round_0/ --model-size tiny --epochs 5
+    # Single HDF5 source:
+    python train.py --data data/round_0.h5 --output models/round_0.pt
 
-    # Mixed data sources (proportional sampling per epoch):
-    python train.py --ccrl data/round_0/ 0.8 --synthetic data/synthetic/ 0.2 \\
+    # Mixed HDF5 sources (proportional blending):
+    python train.py --ccrl data/round_0.h5 0.8 --synthetic data/synthetic.h5 0.2 \
         --output models/round_0.pt --epoch-size 5000000
+
+    # Resume from checkpoint:
+    python train.py --data data/round_0.h5 --checkpoint models/round_0.pt \
+        --output models/round_1.pt
 """
 
 import argparse
-import ctypes
-import faulthandler
 import gc
 import math
 import os
-import resource
-import sys
 import time
-from collections import OrderedDict
-from pathlib import Path
 
-# Print Python traceback on segfault/bus error to stderr
-faulthandler.enable()
-
-# glibc's malloc_trim: force return of freed heap memory to the OS
-try:
-    _libc = ctypes.CDLL("libc.so.6")
-    def _malloc_trim():
-        _libc.malloc_trim(0)
-except OSError:
-    def _malloc_trim():
-        pass
-
+import h5py
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -53,143 +34,133 @@ from torch.utils.tensorboard import SummaryWriter
 from model import create_model, ChessTransformer
 from config import TrainingConfig, MODEL_CONFIGS
 
+# Board encoding constants
+HALFMOVE_TOKEN = 64
+HALFMOVE_FEAT = 26
+HALFMOVE_SCALE = 255.0
 
-class ChessDataset(Dataset):
+
+class PreloadedDataset(Dataset):
     """
-    Load training data from .npz chunks.
+    In-memory dataset loaded from one or more HDF5 files.
 
-    Supports two modes:
-    - Eager (default): loads all chunks into RAM. Fast but memory-heavy.
-    - Lazy: LRU cache of N chunks in memory, loads on demand.
-      Uses bisect for O(log n) chunk lookup instead of linear scan.
-      Suitable for 12M+ positions with <4GB RAM.
+    All data is read into RAM as contiguous torch tensors at construction
+    time. HDF5 files are opened, read, and immediately closed — no file
+    handles remain during training. Tensors own their memory outright
+    (created via torch.tensor(), not torch.from_numpy()).
     """
 
-    def __init__(self, data_dir: str, lazy: bool = False, chunk_cache_size: int = 3):
-        self.data_dir = data_dir
-        self.lazy = lazy
-        self.chunk_cache_size = chunk_cache_size
+    def __init__(
+        self,
+        sources: dict[str, tuple[str, float]],
+        epoch_size: int | None = None,
+        seed: int = 42,
+    ):
+        """
+        Args:
+            sources: {"name": (h5_path, ratio)} — ratios are normalized.
+            epoch_size: Cap on positions per epoch. None = use everything.
+            seed: RNG seed for subsampling when epoch_size < total.
+        """
+        super().__init__()
 
-        # Load metadata
-        meta_path = os.path.join(data_dir, "metadata.npz")
-        if os.path.exists(meta_path):
-            meta = dict(np.load(meta_path))
-            self.num_chunks = int(meta["num_chunks"])
-            self.has_policy = bool(meta.get("has_policy", False))
-        else:
-            self.num_chunks = len(list(Path(data_dir).glob("chunk_*.npz")))
-            self.has_policy = False
+        # Normalize ratios
+        raw_ratios = {name: ratio for name, (_, ratio) in sources.items()}
+        total_ratio = sum(raw_ratios.values())
+        ratios = {k: v / total_ratio for k, v in raw_ratios.items()} if total_ratio > 0 else raw_ratios
 
-        # Discover actual chunk files and sizes
-        self.chunk_paths = []
-        self.chunk_sizes = []
-        self.cumulative_sizes = []
-        total = 0
+        # Read all sources into numpy lists, then concatenate once
+        all_boards: list[np.ndarray] = []
+        all_values: list[np.ndarray] = []
+        all_policies: list[np.ndarray] = []
+        board_dtype = np.float32
 
-        for i in range(self.num_chunks):
-            path = os.path.join(data_dir, f"chunk_{i:04d}.npz")
+        print("Loading HDF5 data into RAM...")
+        for name, (path, _) in sources.items():
             if not os.path.exists(path):
-                break
-            self.chunk_paths.append(path)
-            with np.load(path) as data:
-                sz = len(data["values"])
-            self.chunk_sizes.append(sz)
-            total += sz
-            self.cumulative_sizes.append(total)
+                print(f"  Warning: '{name}' not found: {path}, skipping")
+                continue
 
-        self.total_size = total
-        self.num_chunks = len(self.chunk_paths)
+            ratio = ratios[name]
+            t0 = time.time()
 
-        if lazy:
-            # LRU cache: OrderedDict of chunk_idx -> (boards, values, policies)
-            self._chunk_cache: OrderedDict[int, tuple] = OrderedDict()
-            print(f"Lazy dataset: {self.total_size:,} positions in {self.num_chunks} chunks "
-                  f"(cache={chunk_cache_size}, policy: {'yes' if self.has_policy else 'no'})")
+            with h5py.File(path, "r") as f:
+                total_positions = int(f.attrs["total_positions"])
+                board_dtype = f["boards"].dtype
+                n_target = int((epoch_size or total_positions) * ratio) if len(sources) > 1 else total_positions
+
+                if n_target >= total_positions:
+                    # Read everything
+                    boards = f["boards"][:]
+                    values = f["values"][:]
+                    policies = f["policies"][:]
+                else:
+                    # Subsample: pick random chunk-aligned slices for efficiency
+                    rng = np.random.default_rng(seed)
+                    indices = np.sort(rng.choice(total_positions, size=n_target, replace=False))
+                    boards = f["boards"][indices]
+                    values = f["values"][indices]
+                    policies = f["policies"][indices]
+
+            elapsed = time.time() - t0
+            print(f"  {name}: {len(values):,} positions loaded in {elapsed:.1f}s "
+                  f"(ratio: {ratio:.0%})")
+
+            all_boards.append(boards)
+            all_values.append(values)
+            all_policies.append(policies)
+            del boards, values, policies
+
+        # Single concatenation
+        boards_np = np.concatenate(all_boards)
+        values_np = np.concatenate(all_values)
+        policies_np = np.concatenate(all_policies)
+        del all_boards, all_values, all_policies
+
+        # Subsample to epoch_size if we loaded more than requested
+        total_loaded = len(values_np)
+        if epoch_size is not None and total_loaded > epoch_size:
+            rng = np.random.default_rng(seed + 1)
+            perm = rng.choice(total_loaded, size=epoch_size, replace=False)
+            boards_np = boards_np[perm]
+            values_np = values_np[perm]
+            policies_np = policies_np[perm]
+            total_loaded = epoch_size
+
+        # Convert uint8 boards to float32 and fix halfmove encoding
+        if board_dtype == np.uint8:
+            boards_f32 = boards_np.astype(np.float32)
+            boards_f32[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
         else:
-            # Eager mode: load everything into memory
-            print(f"Loading {self.num_chunks} chunks from {data_dir}...")
-            boards, values, policies = [], [], []
-            for path in self.chunk_paths:
-                data = np.load(path)
-                boards.append(data["boards"])
-                values.append(data["values"])
-                if "policies" in data:
-                    policies.append(data["policies"])
+            boards_f32 = boards_np.astype(np.float32)
+        del boards_np
 
-            self.boards = np.concatenate(boards, axis=0)
-            self.values = np.concatenate(values, axis=0)
-            self.policies = np.concatenate(policies, axis=0) if policies else None
-            print(f"Loaded {self.total_size:,} positions "
-                  f"(policy: {'yes' if self.policies is not None else 'no'})")
-
-    def _load_chunk(self, chunk_idx: int) -> tuple:
-        """Load a chunk into the LRU cache and return (boards, values, policies).
-        Arrays are copied to avoid dangling references to NpzFile buffers."""
-        if chunk_idx in self._chunk_cache:
-            # Move to end (most recently used)
-            self._chunk_cache.move_to_end(chunk_idx)
-            return self._chunk_cache[chunk_idx]
-
-        # Evict oldest if cache is full
-        while len(self._chunk_cache) >= self.chunk_cache_size:
-            self._chunk_cache.popitem(last=False)
-
-        with np.load(self.chunk_paths[chunk_idx]) as data:
-            entry = (
-                data["boards"].copy(),
-                data["values"].copy(),
-                data["policies"].copy() if "policies" in data else None,
+        # Validate policy range
+        max_pol = int(policies_np.max())
+        if max_pol >= 4096:
+            raise ValueError(
+                f"Policy index {max_pol} >= 4096. Data may be corrupt."
             )
-        self._chunk_cache[chunk_idx] = entry
-        return entry
 
-    def _find_chunk(self, idx: int) -> tuple[int, int]:
-        """Find which chunk contains global index idx using bisect (O(log n))."""
-        import bisect
-        ci = bisect.bisect_right(self.cumulative_sizes, idx)
-        if ci >= self.num_chunks:
-            raise IndexError(f"Index {idx} out of range (total: {self.total_size})")
-        local = idx - (self.cumulative_sizes[ci - 1] if ci > 0 else 0)
-        return ci, local
+        # Create tensors that OWN their memory (torch.tensor copies data)
+        self.boards = torch.tensor(boards_f32, dtype=torch.float32)
+        self.values = torch.tensor(values_np, dtype=torch.float32)
+        self.policies = torch.tensor(policies_np.astype(np.int64), dtype=torch.long)
+
+        # Free numpy arrays — tensors are fully independent now
+        del boards_f32, values_np, policies_np
+        gc.collect()
+
+        print(f"  Total: {len(self.values):,} positions in memory "
+              f"({self.boards.nbytes / 1e9:.1f} GB boards + "
+              f"{self.values.nbytes / 1e6:.0f} MB values + "
+              f"{self.policies.nbytes / 1e6:.0f} MB policies)")
 
     def __len__(self) -> int:
-        return self.total_size
+        return len(self.values)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.lazy:
-            ci, local = self._find_chunk(idx)
-            boards, values, policies = self._load_chunk(ci)
-            board = torch.from_numpy(boards[local].copy())
-            value = torch.tensor(values[local])
-            pol = policies[local] if policies is not None else 0
-            policy = torch.tensor(pol, dtype=torch.long)
-        else:
-            board = torch.from_numpy(self.boards[idx])
-            value = torch.tensor(self.values[idx])
-            pol = self.policies[idx] if self.policies is not None else 0
-            policy = torch.tensor(pol, dtype=torch.long)
-        return board, value, policy
-
-
-def _log_diagnostics(label: str, device: torch.device, dataset=None):
-    """Print memory/resource diagnostics for crash investigation."""
-    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    try:
-        n_fds = len(os.listdir(f"/proc/{os.getpid()}/fd"))
-    except OSError:
-        n_fds = -1
-    parts = [f"  [{label}] RSS: {rss_mb:.0f} MB, FDs: {n_fds}"]
-    if device.type == "cuda":
-        gpu_alloc = torch.cuda.memory_allocated() / 1e6
-        gpu_reserved = torch.cuda.memory_reserved() / 1e6
-        parts.append(f"GPU: {gpu_alloc:.0f}/{gpu_reserved:.0f} MB (alloc/reserved)")
-    if dataset is not None and hasattr(dataset, 'cache_stats'):
-        cs = dataset.cache_stats()
-        parts.append(
-            f"cache: {cs['cache_size']}/{cs['cache_capacity']} chunks, "
-            f"{cs['total_loads']} loads"
-        )
-    print(", ".join(parts), flush=True)
+        return self.boards[idx], self.values[idx], self.policies[idx]
 
 
 def train(
@@ -200,16 +171,8 @@ def train(
     device: torch.device,
     log_dir: str | None = None,
     val_loader: DataLoader | None = None,
-    sampler=None,
-    dataset=None,
 ) -> None:
-    """Main training loop with warmup, validation, and per-loss tracking.
-
-    Args:
-        sampler: Optional ProportionalSampler; if provided, set_epoch() is
-                 called each epoch for reproducible shuffling.
-        dataset: Optional dataset for diagnostic cache stats.
-    """
+    """Main training loop with warmup, cosine decay, mixed precision, and checkpointing."""
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -217,12 +180,7 @@ def train(
         weight_decay=config.weight_decay,
     )
 
-    # Linear warmup then cosine decay
-    try:
-        steps_per_epoch = len(train_loader)
-    except TypeError:
-        # IterableDataset — compute from dataset length
-        steps_per_epoch = len(dataset) // config.batch_size
+    steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * config.epochs
 
     def lr_lambda(step: int) -> float:
@@ -232,11 +190,7 @@ def train(
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # Mixed precision scaler
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
-    # TensorBoard
     writer = SummaryWriter(log_dir=log_dir) if log_dir else None
 
     model.train()
@@ -244,28 +198,16 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(config.epochs):
-        # Force garbage collection and return freed memory to OS
-        gc.collect()
-        _malloc_trim()
-
-        if dataset is not None and hasattr(dataset, 'load_epoch'):
-            dataset.load_epoch(epoch)
-        elif sampler is not None:
-            sampler.set_epoch(epoch)
-        elif dataset is not None and hasattr(dataset, 'set_epoch'):
-            dataset.set_epoch(epoch)
-
-        _log_diagnostics(f"epoch {epoch+1} start", device, dataset)
         epoch_loss = 0.0
         epoch_value_loss = 0.0
         epoch_policy_loss = 0.0
         epoch_samples = 0
         t0 = time.time()
 
-        for batch_idx, (boards, values, policies) in enumerate(train_loader):
-            boards = boards.to(device)
-            values = values.to(device)
-            policies = policies.to(device)
+        for boards, values, policies in train_loader:
+            boards = boards.to(device, non_blocking=True)
+            values = values.to(device, non_blocking=True)
+            policies = policies.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -280,10 +222,8 @@ def train(
                         config.policy_loss_weight * policy_loss)
 
             scaler.scale(loss).backward()
-
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -301,7 +241,6 @@ def train(
                 writer.add_scalar("loss/policy", policy_loss.item(), global_step)
                 writer.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
 
-        # Epoch summary
         avg_loss = epoch_loss / epoch_samples
         avg_value_loss = epoch_value_loss / epoch_samples
         avg_policy_loss = epoch_policy_loss / epoch_samples
@@ -318,7 +257,6 @@ def train(
             f"{elapsed:.1f}s",
             flush=True,
         )
-        _log_diagnostics(f"epoch {epoch+1} end", device, dataset)
 
         if writer:
             writer.add_scalar("epoch/loss", avg_loss, epoch)
@@ -329,11 +267,11 @@ def train(
         val_loss = None
         if val_loader is not None and (epoch + 1) % config.eval_every == 0:
             val_loss = _evaluate(model, val_loader, config, device)
-            print(f"  val_loss: {val_loss:.6f}")
+            print(f"  val_loss: {val_loss:.6f}", flush=True)
             if writer:
                 writer.add_scalar("epoch/val_loss", val_loss, epoch)
 
-        # Save checkpoint
+        # Checkpoint
         if (epoch + 1) % config.save_every == 0:
             checkpoint = {
                 "epoch": epoch + 1,
@@ -344,16 +282,16 @@ def train(
                 "loss": avg_loss,
             }
             torch.save(checkpoint, output_path)
-            print(f"  Saved checkpoint to {output_path}")
+            print(f"  Saved checkpoint to {output_path}", flush=True)
 
-            # Best model: prefer val loss if available, else train loss
             compare_loss = val_loss if val_loss is not None else avg_loss
             if compare_loss < best_val_loss:
                 best_val_loss = compare_loss
                 best_path = output_path.replace(".pt", "_best.pt")
                 torch.save(checkpoint, best_path)
                 print(f"  New best model: {best_path} "
-                      f"({'val' if val_loss is not None else 'train'}_loss={compare_loss:.6f})")
+                      f"({'val' if val_loss is not None else 'train'}_loss="
+                      f"{compare_loss:.6f})", flush=True)
 
     if writer:
         writer.close()
@@ -374,9 +312,9 @@ def _evaluate(
     total_samples = 0
 
     for boards, values, policies in val_loader:
-        boards = boards.to(device)
-        values = values.to(device)
-        policies = policies.to(device)
+        boards = boards.to(device, non_blocking=True)
+        values = values.to(device, non_blocking=True)
+        policies = policies.to(device, non_blocking=True)
 
         pred_value, pred_policy = model(boards)
         pred_value = pred_value.squeeze(-1)
@@ -394,43 +332,51 @@ def _evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train chess transformer")
-    parser.add_argument("--data", default=None, help="Training data directory (single source)")
-    parser.add_argument("--output", default="models/model.pt", help="Output model path")
-    parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
-    parser.add_argument("--model-size", default="small", choices=["tiny", "small", "medium"])
-    parser.add_argument("--epochs", type=int, default=10)
+    parser = argparse.ArgumentParser(description="Train chess transformer (v2)")
+    parser.add_argument("--data", default=None,
+                        help="Single HDF5 file (e.g., data/round_0.h5)")
+    parser.add_argument("--output", default="models/model.pt",
+                        help="Output model path")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Resume from checkpoint")
+    parser.add_argument("--model-size", default="small",
+                        choices=["tiny", "small", "medium"])
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lazy", action="store_true", help="Lazy data loading (low RAM)")
-    parser.add_argument("--log-dir", default="runs/", help="TensorBoard log dir")
+    parser.add_argument("--log-dir", default="runs/",
+                        help="TensorBoard log dir")
     parser.add_argument("--val-fraction", type=float, default=0.05,
                         help="Fraction of data for validation (default: 0.05)")
-    # Multi-source mixing
-    parser.add_argument("--ccrl", nargs=2, metavar=("DIR", "RATIO"),
-                        help="CCRL data directory and ratio (e.g., data/round_0/ 0.8)")
-    parser.add_argument("--synthetic", nargs=2, metavar=("DIR", "RATIO"),
-                        help="Synthetic data directory and ratio (e.g., data/synthetic/ 0.2)")
-    parser.add_argument("--endgame", nargs=2, metavar=("DIR", "RATIO"),
-                        help="Endgame data directory and ratio")
-    parser.add_argument("--opening", nargs=2, metavar=("DIR", "RATIO"),
-                        help="Opening data directory and ratio")
     parser.add_argument("--epoch-size", type=int, default=None,
-                        help="Positions per epoch when mixing (default: total dataset size)")
+                        help="Cap positions per epoch (default: use all data)")
+
+    # Multi-source mixing (HDF5 files only)
+    parser.add_argument("--ccrl", nargs=2, metavar=("H5_FILE", "RATIO"),
+                        help="CCRL HDF5 file and ratio (e.g., data/round_0.h5 0.8)")
+    parser.add_argument("--synthetic", nargs=2, metavar=("H5_FILE", "RATIO"),
+                        help="Synthetic HDF5 file and ratio")
+    parser.add_argument("--endgame", nargs=2, metavar=("H5_FILE", "RATIO"),
+                        help="Endgame HDF5 file and ratio")
+    parser.add_argument("--opening", nargs=2, metavar=("H5_FILE", "RATIO"),
+                        help="Opening HDF5 file and ratio")
+
     args = parser.parse_args()
 
-    # Determine data mode: mixed sources vs single directory
-    mix_sources = {}
+    # Build sources dict
+    sources = {}
     for name in ["ccrl", "synthetic", "endgame", "opening"]:
         val = getattr(args, name)
         if val:
-            mix_sources[name] = (val[0], float(val[1]))
+            sources[name] = (val[0], float(val[1]))
 
-    use_mixed = len(mix_sources) > 0
-    if not use_mixed and args.data is None:
-        parser.error("Either --data or at least one source (--ccrl, --synthetic, etc.) is required")
-    if use_mixed and args.data:
-        parser.error("Cannot use --data together with --ccrl/--synthetic/--endgame/--opening")
+    if args.data:
+        if sources:
+            parser.error("Cannot use --data with --ccrl/--synthetic/--endgame/--opening")
+        sources["data"] = (args.data, 1.0)
+
+    if not sources:
+        parser.error("Provide --data or at least one source (--ccrl, --synthetic, etc.)")
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -438,10 +384,10 @@ def main():
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name()}")
 
-    # Create or load model
+    # Load model
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
         from config import ModelConfig
         config = ModelConfig(**checkpoint["config"])
         model = ChessTransformer(config).to(device)
@@ -457,106 +403,49 @@ def main():
         val_fraction=args.val_fraction,
     )
 
-    sampler = None
+    # Load dataset — all HDF5 I/O happens here, before training
+    dataset = PreloadedDataset(
+        sources, epoch_size=args.epoch_size, seed=42,
+    )
 
-    if use_mixed:
-        # Detect format: .h5 files → HDF5 dataset, directories → legacy npz
-        use_hdf5 = any(
-            path.endswith(".h5") for path, _ in mix_sources.values()
+    # Train/val split
+    val_loader = None
+    if train_config.val_fraction > 0:
+        val_size = max(1, int(len(dataset) * train_config.val_fraction))
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
         )
-
-        if use_hdf5:
-            from hdf5_dataset import HDF5EpochDataset
-            print(f"\nMixed-source training (HDF5):")
-            epoch_size = args.epoch_size  # None → uses total dataset size
-            dataset = HDF5EpochDataset(
-                mix_sources, epoch_size=epoch_size,
-            )
-
-            val_loader = None
-            if train_config.val_fraction > 0:
-                print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
-
-            num_workers = 0
-            train_loader = DataLoader(
-                dataset,
-                batch_size=train_config.batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
-                drop_last=True,
-            )
-            print(f"  Batches per epoch: {len(dataset) // train_config.batch_size}")
-        else:
-            from data_mixer import DataMixer, ProportionalSampler
-            print(f"\nMixed-source training (npz):")
-            mixer = DataMixer(mix_sources)
-            dataset = mixer.dataset
-            epoch_size = args.epoch_size or dataset.total_size
-
-            val_loader = None
-            if train_config.val_fraction > 0:
-                print(f"  Note: validation uses {train_config.val_fraction:.0%} of epoch samples")
-
-            sampler = ProportionalSampler(dataset, epoch_size=epoch_size)
-
-            num_workers = 0
-            train_loader = DataLoader(
-                dataset,
-                batch_size=train_config.batch_size,
-                sampler=sampler,
-                num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
-                drop_last=True,
-            )
-            print(f"  Epoch size: {epoch_size:,} positions")
-            print(f"  Batches per epoch: {len(train_loader)}")
+        print(f"Split: {train_size:,} train, {val_size:,} val")
     else:
-        # Single-source mode (original behavior)
-        dataset = ChessDataset(args.data, lazy=args.lazy)
+        train_dataset = dataset
 
-        # Train/val split
-        val_loader = None
-        if train_config.val_fraction > 0:
-            val_size = max(1, int(len(dataset) * train_config.val_fraction))
-            train_size = len(dataset) - val_size
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                dataset, [train_size, val_size],
-                generator=torch.Generator().manual_seed(42),
-            )
-            print(f"Split: {train_size:,} train, {val_size:,} val")
-        else:
-            train_dataset = dataset
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_config.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
 
-        num_workers = 0 if args.lazy else train_config.num_workers
-
-        train_loader = DataLoader(
-            train_dataset,
+    if train_config.val_fraction > 0:
+        val_loader = DataLoader(
+            val_dataset,
             batch_size=train_config.batch_size,
-            shuffle=True,
-            num_workers=num_workers,
+            shuffle=False,
+            num_workers=0,
             pin_memory=(device.type == "cuda"),
-            drop_last=True,
         )
 
-        if train_config.val_fraction > 0:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=train_config.batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
-            )
+    print(f"Batches per epoch: {len(train_loader)}")
 
-        print(f"Batches per epoch: {len(train_loader)}")
-
-    # Create output directory
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-    # Train
+    # Train — no open file handles, no shared memory, just tensors
     train(model, train_loader, train_config, args.output, device,
-          args.log_dir, val_loader, sampler=sampler,
-          dataset=dataset if use_mixed else None)
+          args.log_dir, val_loader)
 
 
 if __name__ == "__main__":
