@@ -317,6 +317,9 @@ def generate_random_position(
         board.set_castling_fen("-")
         board.ep_square = None
 
+        # Vary the halfmove clock so the global context token isn't always zero
+        board.halfmove_clock = random.randint(0, 40)
+
         # Pick side to move randomly
         board.turn = random.choice([chess.WHITE, chess.BLACK])
 
@@ -348,7 +351,13 @@ def generate_positions_for_config(
 
     while len(results) < config.num_positions and attempts < max_total:
         attempts += 1
-        board = generate_random_position(white_pieces, black_pieces)
+        # Randomly assign the stronger side to white or black so both
+        # colors appear with all piece types (avoids dead planes like
+        # plane 10 = black queen never being set).
+        if random.random() < 0.5:
+            board = generate_random_position(white_pieces, black_pieces)
+        else:
+            board = generate_random_position(black_pieces, white_pieces)
         if board is not None:
             results.append((board.fen(), None))
 

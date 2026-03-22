@@ -87,7 +87,7 @@ class PreloadedDataset(Dataset):
             with h5py.File(path, "r") as f:
                 total_positions = int(f.attrs["total_positions"])
                 board_dtype = f["boards"].dtype
-                n_target = int((epoch_size or total_positions) * ratio) if len(sources) > 1 else total_positions
+                n_target = min(int((epoch_size or total_positions) * ratio), total_positions)
 
                 if n_target >= total_positions:
                     # Read everything
@@ -95,12 +95,35 @@ class PreloadedDataset(Dataset):
                     values = f["values"][:]
                     policies = f["policies"][:]
                 else:
-                    # Subsample: pick random chunk-aligned slices for efficiency
+                    # Read random full chunks sequentially (fast for gzip-compressed HDF5)
+                    chunk_size = f["boards"].chunks[0]
+                    n_chunks_total = math.ceil(total_positions / chunk_size)
+                    n_chunks_needed = min(
+                        math.ceil(n_target / chunk_size),
+                        n_chunks_total,
+                    )
                     rng = np.random.default_rng(seed)
-                    indices = np.sort(rng.choice(total_positions, size=n_target, replace=False))
-                    boards = f["boards"][indices]
-                    values = f["values"][indices]
-                    policies = f["policies"][indices]
+                    chosen = np.sort(rng.choice(n_chunks_total, size=n_chunks_needed, replace=False))
+
+                    chunk_boards, chunk_values, chunk_policies = [], [], []
+                    for ci in chosen:
+                        start = int(ci) * chunk_size
+                        end = min(start + chunk_size, total_positions)
+                        chunk_boards.append(f["boards"][start:end])
+                        chunk_values.append(f["values"][start:end])
+                        chunk_policies.append(f["policies"][start:end])
+
+                    boards = np.concatenate(chunk_boards)
+                    values = np.concatenate(chunk_values)
+                    policies = np.concatenate(chunk_policies)
+                    del chunk_boards, chunk_values, chunk_policies
+
+                    # Trim to exact target size if we read more than needed
+                    if len(values) > n_target:
+                        perm = rng.choice(len(values), size=n_target, replace=False)
+                        boards = boards[perm]
+                        values = values[perm]
+                        policies = policies[perm]
 
             elapsed = time.time() - t0
             print(f"  {name}: {len(values):,} positions loaded in {elapsed:.1f}s "
@@ -127,14 +150,6 @@ class PreloadedDataset(Dataset):
             policies_np = policies_np[perm]
             total_loaded = epoch_size
 
-        # Convert uint8 boards to float32 and fix halfmove encoding
-        if board_dtype == np.uint8:
-            boards_f32 = boards_np.astype(np.float32)
-            boards_f32[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
-        else:
-            boards_f32 = boards_np.astype(np.float32)
-        del boards_np
-
         # Validate policy range
         max_pol = int(policies_np.max())
         if max_pol >= 4096:
@@ -142,13 +157,22 @@ class PreloadedDataset(Dataset):
                 f"Policy index {max_pol} >= 4096. Data may be corrupt."
             )
 
-        # Create tensors that OWN their memory (torch.tensor copies data)
-        self.boards = torch.tensor(boards_f32, dtype=torch.float32)
+        # Convert to torch tensors with minimal peak memory.
+        # For boards (dominant allocation): from_numpy() shares memory with
+        # the uint8 array, then .float() creates an independent float32 copy.
+        # Peak: 1× uint8 + 4× float32 = 5× (vs 9× with intermediate numpy copy).
+        self.boards = torch.from_numpy(boards_np).float()
+        del boards_np
+
+        # Fix halfmove clock encoding in-place (uint8 0–255 → float 0.0–1.0)
+        if board_dtype == np.uint8:
+            self.boards[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
+
         self.values = torch.tensor(values_np, dtype=torch.float32)
         self.policies = torch.tensor(policies_np.astype(np.int64), dtype=torch.long)
 
         # Free numpy arrays — tensors are fully independent now
-        del boards_f32, values_np, policies_np
+        del values_np, policies_np
         gc.collect()
 
         print(f"  Total: {len(self.values):,} positions in memory "
