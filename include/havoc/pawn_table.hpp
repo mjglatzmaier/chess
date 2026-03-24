@@ -16,6 +16,8 @@ struct parameters;
 struct pawn_entry {
     U64 key = 0;
     int16_t score = 0;
+    int16_t score_mg = 0; // middlegame pawn PST component
+    int16_t score_eg = 0; // endgame pawn PST component
 
     U64 doubled[2]{};
     U64 isolated[2]{};
@@ -27,8 +29,6 @@ struct pawn_entry {
     U64 attacks[2]{};
     U64 undefended[2]{};
     U64 weak_squares[2]{};
-    U64 chaintips[2]{};
-    U64 chainbases[2]{};
     U64 queenside[2]{};
     U64 kingside[2]{};
     U64 semiopen[2]{};

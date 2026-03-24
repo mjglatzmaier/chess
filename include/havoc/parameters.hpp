@@ -104,7 +104,6 @@ struct parameters {
     static constexpr int backward_pawn_penalty = 1;
     static constexpr int isolated_pawn_penalty = 4;
     static constexpr int passed_pawn_bonus = 2;
-    static constexpr int semi_open_pawn_penalty = 1;
 
     // Material values
     std::array<int, 6> material_value = {100, 300, 315, 480, 910, 20000};
@@ -123,12 +122,6 @@ struct parameters {
 
     // Search
     int fixed_depth = -1;
-
-    static constexpr int pawn_lever_score[64] = {
-        1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3,
-        2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4,
-        4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1, 1, 2, 3, 4, 4, 3, 2, 1,
-    };
 
     // Parameter serialization
     bool load(const std::string& filename);

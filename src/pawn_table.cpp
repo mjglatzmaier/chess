@@ -29,12 +29,13 @@ template <Color c> bool backward_pawn(int row, int col, U64 pawns) {
         if (left != -1) {
             int sq = -1;
             U64 left_pawns = bitboards::col[left] & pawns;
+            bool no_left_pawns = (left_pawns == 0ULL);
             while (left_pawns) {
                 int tmp = bits::pop_lsb(left_pawns);
                 if (tmp > sq)
                     sq = tmp;
             }
-            left_greater = sq > 0 && util::row(sq) > row;
+            left_greater = (sq > 0 && util::row(sq) > row) || no_left_pawns;
         }
         if (right != -1) {
             int sq = -1;
@@ -79,7 +80,8 @@ template <Color c> bool backward_pawn(int row, int col, U64 pawns) {
 const float pawn_scaling[8] = {0.86f, 0.90f, 0.95f, 1.00f, 1.00f, 0.95f, 0.90f, 0.86f};
 const float material_vals[5] = {100.0f, 300.0f, 315.0f, 480.0f, 910.0f};
 
-template <Color c> int16_t evaluate_pawns(const position& p, pawn_entry& e, const parameters& par) {
+template <Color c> int16_t evaluate_pawns(const position& p, pawn_entry& e, const parameters& par,
+                                          int16_t& mg_pst_out, int16_t& eg_pst_out) {
     constexpr Color them = Color(c ^ 1);
 
     U64 pawns = p.get_pieces<c, pawn>();
@@ -89,6 +91,8 @@ template <Color c> int16_t evaluate_pawns(const position& p, pawn_entry& e, cons
     Square ksq = p.king_square(c);
 
     int16_t score = 0;
+    int16_t mg_pst = 0;
+    int16_t eg_pst = 0;
     U64 locked_bb = 0ULL;
 
     for (Square s = *sqs; s != no_square; s = *++sqs) {
@@ -97,7 +101,9 @@ template <Color c> int16_t evaluate_pawns(const position& p, pawn_entry& e, cons
         int row = util::row(s);
         int col_idx = util::col(s);
 
-        score += static_cast<int16_t>(par.sq_score_scaling[pawn] * square_score<c>(pawn, s, 0));
+        // Separate MG and EG pawn PST scores for tapering
+        mg_pst += static_cast<int16_t>(par.sq_score_scaling[pawn] * square_score<c>(pawn, s, 0));
+        eg_pst += static_cast<int16_t>(par.sq_score_scaling[pawn] * square_score<c>(pawn, s, 24));
         score += static_cast<int16_t>(pawn_scaling[col_idx] * material_vals[pawn]);
 
         // Pawn attacks
@@ -188,6 +194,9 @@ template <Color c> int16_t evaluate_pawns(const position& p, pawn_entry& e, cons
     if (bits::count(locked_bb) >= 2)
         e.locked_center = true;
 
+    mg_pst_out = mg_pst;
+    eg_pst_out = eg_pst;
+
     return score;
 }
 
@@ -221,8 +230,12 @@ pawn_entry* pawn_table::fetch(const position& p) const {
     }
     std::memset(&entries_[idx], 0, sizeof(pawn_entry));
     entries_[idx].key = k;
-    entries_[idx].score = evaluate_pawns<white>(p, entries_[idx], *params_) -
-                          evaluate_pawns<black>(p, entries_[idx], *params_);
+    int16_t w_mg, w_eg, b_mg, b_eg;
+    int16_t w_score = evaluate_pawns<white>(p, entries_[idx], *params_, w_mg, w_eg);
+    int16_t b_score = evaluate_pawns<black>(p, entries_[idx], *params_, b_mg, b_eg);
+    entries_[idx].score = w_score - b_score;
+    entries_[idx].score_mg = w_mg - b_mg;
+    entries_[idx].score_eg = w_eg - b_eg;
     return &entries_[idx];
 }
 

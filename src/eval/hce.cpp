@@ -53,7 +53,16 @@ int HCEEvaluator::evaluate(const position& p, int lazy_margin) {
     ei.pawn_holes[white] = ei.pe->backward[white] << 8;
     ei.pawn_holes[black] = ei.pe->backward[black] >> 8;
 
+    // Wire up pawn color bitboards for bishop evaluation
+    ei.white_pawns[white] = ei.pe->light[white];
+    ei.white_pawns[black] = ei.pe->light[black];
+    ei.black_pawns[white] = ei.pe->dark[white];
+    ei.black_pawns[black] = ei.pe->dark[black];
+
     score += ei.pe->score;
+    // Taper pawn PST scores by game phase
+    int phase = ei.me->phase_interpolant;
+    score += (ei.pe->score_eg * phase + ei.pe->score_mg * (24 - phase)) / 24;
     score += ei.me->score;
 
     // Lazy eval cutoff
@@ -446,10 +455,18 @@ template <Color c> int HCEEvaluator::eval_queens(const position& p, einfo& ei) {
                       p.get_pieces<them, bishop>() | p.get_pieces<them, rook>();
 
     for (Square s = *queens; s != no_square; s = *++queens) {
+        score +=
+            params_.sq_score_scaling[queen] * square_score<c>(queen, s, ei.me->phase_interpolant);
+
         // Mobility
         U64 mvs =
             magics::attacks<bishop>(ei.all_pieces, s) | magics::attacks<rook>(ei.all_pieces, s);
         ei.piece_attacks[c][queen] |= mvs;
+
+        // Queen mobility
+        U64 safe_mobility = (mvs & ei.empty) & (~ei.pe->attacks[them]);
+        int qmob = bits::count(safe_mobility);
+        score += std::min(qmob, 14) / 2;
 
         // Weak queen penalty
         U64 attackers = p.attackers_of2(s, them) & weakEnemies;

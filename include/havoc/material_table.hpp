@@ -15,7 +15,7 @@ class position;
 struct material_entry {
     U64 key = 0;
     int16_t score = 0;
-    int phase_interpolant = 0; // 0 = endgame, 24 = middlegame
+    int phase_interpolant = 0; // 0 = middlegame (all pieces), 24 = endgame (no pieces)
     EndgameType endgame = EndgameType::none;
     U8 number[5]{}; // indexed by Piece (knight..queen)
 
