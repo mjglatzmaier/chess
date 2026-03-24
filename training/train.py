@@ -44,10 +44,12 @@ class PreloadedDataset(Dataset):
     """
     In-memory dataset loaded from one or more HDF5 files.
 
-    All data is read into RAM as contiguous torch tensors at construction
-    time. HDF5 files are opened, read, and immediately closed — no file
-    handles remain during training. Tensors own their memory outright
-    (created via torch.tensor(), not torch.from_numpy()).
+    All data is read into RAM at construction time. HDF5 files are opened,
+    read, and immediately closed — no file handles remain during training.
+
+    Boards are stored as uint8 tensors (1 byte per feature) and converted
+    to float32 on-the-fly in __getitem__. This keeps resident memory at
+    ~1× raw data size instead of 4× for float32 storage.
     """
 
     def __init__(
@@ -69,33 +71,59 @@ class PreloadedDataset(Dataset):
         total_ratio = sum(raw_ratios.values())
         ratios = {k: v / total_ratio for k, v in raw_ratios.items()} if total_ratio > 0 else raw_ratios
 
-        # Read all sources into numpy lists, then concatenate once
-        all_boards: list[np.ndarray] = []
-        all_values: list[np.ndarray] = []
-        all_policies: list[np.ndarray] = []
-        board_dtype = np.float32
+        # Probe all sources first to estimate memory before loading
+        source_info: list[tuple[str, str, float, int, np.dtype]] = []
+        total_available = 0
+        any_uint8 = False
 
-        print("Loading HDF5 data into RAM...")
         for name, (path, _) in sources.items():
             if not os.path.exists(path):
                 print(f"  Warning: '{name}' not found: {path}, skipping")
                 continue
-
             ratio = ratios[name]
+            with h5py.File(path, "r") as f:
+                n = int(f.attrs["total_positions"])
+                dtype = f["boards"].dtype
+                if dtype == np.uint8:
+                    any_uint8 = True
+                source_info.append((name, path, ratio, n, dtype))
+                total_available += n
+
+        effective_size = epoch_size if epoch_size is not None else total_available
+        # Memory estimate: boards (uint8) + values (f32) + policies (i64)
+        bytes_per_pos = 65 * 27 * 1 + 4 + 8  # uint8 boards + f32 value + i64 policy
+        est_bytes = effective_size * bytes_per_pos
+        est_gb = est_bytes / (1024 ** 3)
+
+        # Check available memory (best-effort, non-fatal)
+        try:
+            import psutil
+            avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+            print(f"Memory estimate: {est_gb:.1f} GB needed, {avail_gb:.1f} GB available")
+            if est_gb > avail_gb * 0.85:
+                print(f"  ⚠ WARNING: Dataset may exceed available RAM. "
+                      f"Use --epoch-size to limit.")
+        except ImportError:
+            print(f"Memory estimate: ~{est_gb:.1f} GB (install psutil for availability check)")
+
+        # Read all sources into numpy lists, then concatenate once
+        all_boards: list[np.ndarray] = []
+        all_values: list[np.ndarray] = []
+        all_policies: list[np.ndarray] = []
+        self._has_uint8 = any_uint8
+
+        print("Loading HDF5 data into RAM...")
+        for name, path, ratio, total_positions, dtype in source_info:
             t0 = time.time()
 
             with h5py.File(path, "r") as f:
-                total_positions = int(f.attrs["total_positions"])
-                board_dtype = f["boards"].dtype
                 n_target = min(int((epoch_size or total_positions) * ratio), total_positions)
 
                 if n_target >= total_positions:
-                    # Read everything
                     boards = f["boards"][:]
                     values = f["values"][:]
                     policies = f["policies"][:]
                 else:
-                    # Read random full chunks sequentially (fast for gzip-compressed HDF5)
                     chunk_size = f["boards"].chunks[0]
                     n_chunks_total = math.ceil(total_positions / chunk_size)
                     n_chunks_needed = min(
@@ -118,27 +146,37 @@ class PreloadedDataset(Dataset):
                     policies = np.concatenate(chunk_policies)
                     del chunk_boards, chunk_values, chunk_policies
 
-                    # Trim to exact target size if we read more than needed
                     if len(values) > n_target:
                         perm = rng.choice(len(values), size=n_target, replace=False)
                         boards = boards[perm]
                         values = values[perm]
                         policies = policies[perm]
 
+                # Normalize boards to uint8 if source is float32
+                if dtype != np.uint8:
+                    boards = np.clip(np.round(boards * 255 if boards.max() <= 1.0 else boards),
+                                     0, 255).astype(np.uint8)
+
             elapsed = time.time() - t0
             print(f"  {name}: {len(values):,} positions loaded in {elapsed:.1f}s "
-                  f"(ratio: {ratio:.0%})")
+                  f"(ratio: {ratio:.0%}, dtype: {dtype})")
 
             all_boards.append(boards)
             all_values.append(values)
             all_policies.append(policies)
             del boards, values, policies
 
-        # Single concatenation
+        # Concatenate and free source lists incrementally to reduce peak memory
         boards_np = np.concatenate(all_boards)
+        del all_boards
+        gc.collect()
+
         values_np = np.concatenate(all_values)
+        del all_values
+
         policies_np = np.concatenate(all_policies)
-        del all_boards, all_values, all_policies
+        del all_policies
+        gc.collect()
 
         # Subsample to epoch_size if we loaded more than requested
         total_loaded = len(values_np)
@@ -148,6 +186,7 @@ class PreloadedDataset(Dataset):
             boards_np = boards_np[perm]
             values_np = values_np[perm]
             policies_np = policies_np[perm]
+            del perm
             total_loaded = epoch_size
 
         # Validate policy range
@@ -157,26 +196,21 @@ class PreloadedDataset(Dataset):
                 f"Policy index {max_pol} >= 4096. Data may be corrupt."
             )
 
-        # Convert to torch tensors with minimal peak memory.
-        # For boards (dominant allocation): from_numpy() shares memory with
-        # the uint8 array, then .float() creates an independent float32 copy.
-        # Peak: 1× uint8 + 4× float32 = 5× (vs 9× with intermediate numpy copy).
-        self.boards = torch.from_numpy(boards_np).float()
+        # Store boards as uint8 tensor — 4× less memory than float32.
+        # Conversion to float32 happens per-batch in __getitem__.
+        self.boards = torch.from_numpy(np.ascontiguousarray(boards_np))
         del boards_np
 
-        # Fix halfmove clock encoding in-place (uint8 0–255 → float 0.0–1.0)
-        if board_dtype == np.uint8:
-            self.boards[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
-
         self.values = torch.tensor(values_np, dtype=torch.float32)
-        self.policies = torch.tensor(policies_np.astype(np.int64), dtype=torch.long)
+        del values_np
 
-        # Free numpy arrays — tensors are fully independent now
-        del values_np, policies_np
+        # Convert directly to int64 without intermediate numpy copy
+        self.policies = torch.from_numpy(policies_np).long()
+        del policies_np
         gc.collect()
 
         print(f"  Total: {len(self.values):,} positions in memory "
-              f"({self.boards.nbytes / 1e9:.1f} GB boards + "
+              f"({self.boards.nbytes / 1e9:.1f} GB boards [uint8] + "
               f"{self.values.nbytes / 1e6:.0f} MB values + "
               f"{self.policies.nbytes / 1e6:.0f} MB policies)")
 
@@ -184,7 +218,10 @@ class PreloadedDataset(Dataset):
         return len(self.values)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.boards[idx], self.values[idx], self.policies[idx]
+        board = self.boards[idx].float()
+        if self._has_uint8:
+            board[HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
+        return board, self.values[idx], self.policies[idx]
 
 
 def train(

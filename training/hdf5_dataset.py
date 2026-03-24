@@ -41,6 +41,24 @@ HALFMOVE_SCALE = 255.0
 H5_CHUNK_CACHE_BYTES = 128 * 1024 * 1024
 
 
+def _warn_if_workers(num_workers: int, dataset_name: str) -> None:
+    """Warn if DataLoader uses workers with HDF5-backed datasets.
+
+    HDF5's C library is not fork-safe. Using num_workers > 0 with open
+    HDF5 file handles causes SIGSEGV on Linux after fork().
+    """
+    if num_workers > 0:
+        import warnings
+        warnings.warn(
+            f"{dataset_name} holds open HDF5 file handles. "
+            f"Using num_workers={num_workers} will likely crash on Linux "
+            f"(HDF5 C library is not fork-safe). Use num_workers=0 or "
+            f"switch to PreloadedDataset / HDF5EpochDataset.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 class HDF5ChessDataset(Dataset):
     """
     Dataset backed by HDF5 files with uint8 boards.
@@ -108,6 +126,7 @@ class HDF5ChessDataset(Dataset):
             print(f"  {name}: {count:,} positions (target ratio: {ratio:.1%})")
         print(f"  Board dtype: {self._board_dtype}, "
               f"encoding v{self._encoding_version}")
+        print("  ⚠ This dataset holds open HDF5 handles — use num_workers=0")
 
     def _find_source(self, idx: int) -> tuple[str, int]:
         """Map global index to (source_name, local_index)."""
@@ -130,13 +149,14 @@ class HDF5ChessDataset(Dataset):
         value = f["values"][local]        # float32 scalar
         policy = f["policies"][local]     # uint16 or int64 scalar
 
-        # Convert uint8 board to float32 for the model
+        # Convert uint8 board to float32 for the model.
+        # Use torch.tensor() (copies data) instead of torch.from_numpy()
+        # to avoid dangling pointer when used with num_workers > 0.
         if self._board_dtype == np.uint8:
-            board = torch.from_numpy(board_raw.astype(np.float32))
-            # Reconstruct halfmove clock from quantized uint8
+            board = torch.tensor(board_raw, dtype=torch.float32)
             board[HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
         else:
-            board = torch.from_numpy(board_raw.copy())
+            board = torch.tensor(board_raw, dtype=torch.float32)
 
         value_t = torch.tensor(value, dtype=torch.float32)
         policy_t = torch.tensor(int(policy), dtype=torch.long)
@@ -334,6 +354,7 @@ class HDF5ChunkIterableDataset(IterableDataset):
                   f"(ratio: {ratio:.1%})")
         print(f"  Epoch size: {self.epoch_size:,}, "
               f"buffer: {buffer_chunks} chunks")
+        print("  ⚠ This dataset holds open HDF5 handles — use num_workers=0")
 
     def _build_chunk_schedule(
         self, rng: np.random.Generator,
@@ -384,30 +405,37 @@ class HDF5ChunkIterableDataset(IterableDataset):
                 f"HDF5 data may be corrupt or use a different encoding."
             )
 
-        # Vectorized float32 conversion (entire buffer at once)
-        boards_f32 = boards.astype(np.float32)
-        if self._board_dtype == np.uint8:
-            boards_f32[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
+        # Shuffle indices
+        perm = rng.permutation(n)[:limit]
 
-        # torch.tensor() copies data so tensors own their memory, decoupled
-        # from the numpy arrays. torch.from_numpy() shares memory, which can
-        # cause use-after-free when the generator's locals are freed while
-        # the DataLoader still holds view references via pin_memory.
-        boards_t = torch.tensor(boards_f32, dtype=torch.float32)
-        values_t = torch.tensor(values, dtype=torch.float32)
-        policies_t = torch.tensor(policies, dtype=torch.long)
+        # Batch-convert shuffled slices to tensors (much faster than per-sample)
+        boards_shuffled = boards[perm]
+        values_shuffled = values[perm]
+        policies_shuffled = policies[perm]
 
-        # Free numpy arrays now that tensors own their own memory
+        # Free numpy originals before float32 conversion
         del buf_boards[:], buf_values[:], buf_policies[:]
-        del boards, values, policies, boards_f32
+        del boards, values, policies
 
-        perm = rng.permutation(n)
+        # Vectorized float32 conversion
+        if self._board_dtype == np.uint8:
+            boards_f32 = boards_shuffled.astype(np.float32)
+            boards_f32[:, HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
+        else:
+            boards_f32 = boards_shuffled.astype(np.float32)
+        del boards_shuffled
 
-        count = 0
+        # Use torch.tensor() (copies) so tensors own their memory, safe
+        # even if generator locals are freed while DataLoader holds references.
+        boards_t = torch.tensor(boards_f32, dtype=torch.float32)
+        values_t = torch.tensor(values_shuffled, dtype=torch.float32)
+        policies_t = torch.tensor(policies_shuffled, dtype=torch.long)
+
+        del boards_f32, values_shuffled, policies_shuffled
+
         for i in range(limit):
-            yield boards_t[perm[i]], values_t[perm[i]], policies_t[perm[i]]
-            count += 1
-        return count
+            yield boards_t[i], values_t[i], policies_t[i]
+        return limit
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self._epoch)
@@ -634,14 +662,16 @@ class HDF5EpochDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         board_raw = self._boards[idx]  # uint8 [65, 27]
 
+        # Use torch.tensor() (copies data) instead of torch.from_numpy()
+        # to avoid dangling pointer when used with num_workers > 0.
         if self._board_dtype == np.uint8:
-            board = board_raw.astype(np.float32)
+            board = torch.tensor(board_raw, dtype=torch.float32)
             board[HALFMOVE_TOKEN, HALFMOVE_FEAT] /= HALFMOVE_SCALE
         else:
-            board = board_raw.astype(np.float32)
+            board = torch.tensor(board_raw, dtype=torch.float32)
 
         return (
-            torch.from_numpy(board),
+            board,
             torch.tensor(self._values[idx], dtype=torch.float32),
             torch.tensor(self._policies[idx], dtype=torch.long),
         )
